@@ -1,0 +1,7 @@
+[package]
+name = "kvfilter"
+version = "0.1.0"
+authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
+
+[dependencies]
+slog = "1.4"
