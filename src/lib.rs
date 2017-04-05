@@ -3,75 +3,36 @@
 extern crate slog;
 use std::collections::HashSet;
 use std::fmt;
+use std::option::Option;
 
-/// Serializer that serializes values to strings
-///
-/// TODO: Work for all types
-/// TODO: Enhance perf. by using thread_local `String` buffer
-struct ToStringSerializer {
-    val: Option<String>,
+use slog::KV;
+
+struct FilteringSerializer<'a> {
+    pending_matches : &'a [(String, HashSet<String>)],
+    // TODO: Make thread_local
+    tmp_str : String,
 }
 
-impl ToStringSerializer {
-    fn new() -> ToStringSerializer {
-        ToStringSerializer { val: None }
-    }
+impl<'a> slog::Serializer for FilteringSerializer<'a> {
+    fn emit_arguments(&mut self, key: slog::Key, val: &fmt::Arguments) -> slog::Result {
+        if self.pending_matches.is_empty() {
+            return Ok(());
+        }
 
-    fn value(&self) -> Option<&String> {
-        self.val.as_ref()
-    }
-}
+        if key == self.pending_matches[0].0 {
+            self.tmp_str.clear();
+            fmt::write(&mut self.tmp_str, *val)?;
 
-macro_rules! impl_empty_emit_for {
-    ($f:ident, $ot:ty) => {
-            fn $f(&mut self, _: &'static str, _: $ot)
-                         -> slog::ser::Result {
-                unreachable!();
+            if self.pending_matches[0].1.contains(&self.tmp_str) {
+                self.pending_matches = &self.pending_matches[1..]
             }
-    };
-}
-
-macro_rules! impl_empty_emit_for_no_param {
-    ($f:ident) => {
-            fn $f(&mut self, _: &'static str)
-                         -> slog::ser::Result {
-                unreachable!();
-            }
-    };
-}
-
-impl slog::Serializer for ToStringSerializer {
-    fn emit_str(&mut self, _: &'static str, val: &str) -> slog::ser::Result {
-        self.val = Some(val.into());
-        Ok(())
-    }
-
-    fn emit_none(&mut self, _: &'static str) -> slog::ser::Result {
-        self.val = None;
+        }
 
         Ok(())
     }
-
-    impl_empty_emit_for_no_param!(emit_unit);
-
-    impl_empty_emit_for!(emit_usize, usize);
-    impl_empty_emit_for!(emit_isize, isize);
-    impl_empty_emit_for!(emit_bool, bool);
-    impl_empty_emit_for!(emit_char, char);
-    impl_empty_emit_for!(emit_u8, u8);
-    impl_empty_emit_for!(emit_u16, u16);
-    impl_empty_emit_for!(emit_u32, u32);
-    impl_empty_emit_for!(emit_u64, u64);
-    impl_empty_emit_for!(emit_i8, i8);
-    impl_empty_emit_for!(emit_i16, i16);
-    impl_empty_emit_for!(emit_i32, i32);
-    impl_empty_emit_for!(emit_i64, i64);
-    impl_empty_emit_for!(emit_f32, f32);
-    impl_empty_emit_for!(emit_f64, f64);
-    impl_empty_emit_for!(emit_arguments, &fmt::Arguments);
 }
 
-type FilteringMap = Vec<(String, HashSet<String>)>;
+type KVFilterList = Vec<(String, HashSet<String>)>;
 
 /// `Drain` filtering records using list of keys and values they
 /// must have.
@@ -105,7 +66,7 @@ type FilteringMap = Vec<(String, HashSet<String>)>;
 /// modules, such as e.g. "sending packets" or "running FSM"
 pub struct KVFilter<D: slog::Drain> {
     drain: D,
-    filters: FilteringMap,
+    filters: KVFilterList,
     level: slog::Level,
 }
 
@@ -115,7 +76,7 @@ impl<D: slog::Drain> KVFilter<D> {
     /// * `drain` - drain to be sent to
     /// * `level` - maximum level filtered, higher levels pass by
     /// * `filters` - LHashmap of keys with lists of allowed values
-    pub fn new(drain: D, level: slog::Level, mut filters: FilteringMap) -> Self {
+    pub fn new(drain: D, level: slog::Level, mut filters: KVFilterList) -> Self {
         KVFilter {
             drain: drain,
             level: level,
@@ -125,59 +86,36 @@ impl<D: slog::Drain> KVFilter<D> {
         }
     }
 
-    fn is_match(&self, info: &slog::Record, logger_values: &slog::OwnedKeyValueList) -> bool {
-        let mut pending_matches = &self.filters[..];
-
+    fn is_match(&self, record: &slog::Record, logger_values: &slog::OwnedKVList) -> bool {
         // Can't use chaining here, as it's not possible to cast
         // SyncSerialize to Serialize
-        for &(k, v) in info.values().iter().rev() {
+        let mut ser = FilteringSerializer {
+            pending_matches: &self.filters[..],
+            tmp_str: String::new(),
+        };
 
-            if pending_matches.is_empty() {
-                return true;
-            }
+        record.kv().serialize(record, &mut ser).unwrap();
 
-            let cur_match = &pending_matches[0];
-            if k == cur_match.0 {
-                let mut s = ToStringSerializer::new();
-                v.serialize(info, k, &mut s).ok();
-                if let Some(v_str) = s.value() {
-                    if cur_match.1.contains(v_str) {
-                        pending_matches = &pending_matches[1..]
-                    }
-                }
-            }
+        if ser.pending_matches.is_empty() {
+            return true;
         }
 
-        for (k, v) in logger_values.iter() {
+        logger_values.serialize(record, &mut ser).unwrap();
 
-            if pending_matches.is_empty() {
-                return true;
-            }
-
-            let cur_match = &pending_matches[0];
-            if k == cur_match.0 {
-                let mut s = ToStringSerializer::new();
-                v.serialize(info, k, &mut s).ok();
-                if let Some(v_str) = s.value() {
-                    if cur_match.1.contains(v_str) {
-                        pending_matches = &pending_matches[1..]
-                    }
-                }
-            }
-        }
-        pending_matches.is_empty()
+        ser.pending_matches.is_empty()
     }
 }
 
 impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
-    type Error = D::Error;
+    type Err = D::Err;
+    type Ok = Option<D::Ok>;
 
-    fn log(&self, info: &slog::Record, logger_values: &slog::OwnedKeyValueList) -> Result<(), Self::Error> {
+    fn log(&self, info: &slog::Record, logger_values: &slog::OwnedKVList) -> Result<Self::Ok, Self::Err> {
         if info.level().is_at_least(self.level)
             || self.is_match(info, logger_values) {
-            self.drain.log(info, logger_values)
+            self.drain.log(info, logger_values).map(Some)
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 }
