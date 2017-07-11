@@ -1,6 +1,6 @@
 [package]
 name = "kvfilter"
-version = "0.2.0"
+version = "0.2.0-pre"
 authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
 description = "Key values based filter Drain for slog-rs"
 keywords = ["slog", "logging", "log", "filter"]
@@ -12,4 +12,4 @@ readme = "README.md"
 
 
 [dependencies]
-slog = "~2.0.0-3"
+slog = "2"
