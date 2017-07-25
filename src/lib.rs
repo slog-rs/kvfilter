@@ -7,19 +7,15 @@
 #[macro_use]
 extern crate slog;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::fmt;
 use std::option::Option;
 
 use slog::KV;
 
-// use std::cell::RefCell;
-//#[thread_local]
-//static mut TMP_STR: RefCell<String> = RefCell::new("".into());
-
+// @todo: must that be thread-safe?
 struct FilteringSerializer<'a> {
-	pending_matches: &'a [(String, HashSet<String>)],
-	#[thread_local]
+	pending_matches: KVFilterListFlyWeight<'a>,
 	tmp_str: String,
 }
 
@@ -29,12 +25,12 @@ impl<'a> slog::Serializer for FilteringSerializer<'a> {
             return Ok(());
         }
 
-        if key == self.pending_matches[0].0 {
+	    if let Some(keyvalues) = self.pending_matches.get(&key) {
             self.tmp_str.clear();
             fmt::write(&mut self.tmp_str, *val)?;
 
-            if self.pending_matches[0].1.contains(&self.tmp_str) {
-                self.pending_matches = &self.pending_matches[1..]
+		    if keyvalues.contains(&self.tmp_str) {
+			    self.pending_matches.remove(&key);
             }
         }
 
@@ -42,7 +38,11 @@ impl<'a> slog::Serializer for FilteringSerializer<'a> {
     }
 }
 
-type KVFilterList = Vec<(String, HashSet<String>)>;
+/// Must be a hashmap since we do not rely on ordered keys
+type KVFilterList = HashMap<String, HashSet<String>>;
+
+/// flyweight copy that is created upfront and given to every serializer
+type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 
 /// `Drain` filtering records using list of keys and values they
 /// must have unless they are of a higher level than filtering applied.
@@ -76,25 +76,29 @@ type KVFilterList = Vec<(String, HashSet<String>)>;
 /// Filtering in large systems that consist of multiple threads of same
 /// code or have functionality of interest spread across many components,
 /// modules, such as e.g. "sending packet" or "running FSM".
-pub struct KVFilter<D: slog::Drain> {
+pub struct KVFilter<'a, D: slog::Drain> {
     drain: D,
     filters: KVFilterList,
+	filters_flyweight: KVFilterListFlyWeight<'a>,
     level: slog::Level,
 }
 
-impl<D: slog::Drain> KVFilter<D> {
+impl<'a, D: slog::Drain> KVFilter<'a, D> {
     /// Create `KVFilter`
     ///
     /// * `drain` - drain to be sent to
     /// * `level` - maximum level filtered, higher levels pass by
-    /// * `filters` - LHashmap of keys with lists of allowed values
+    /// * `filters` - Hashmap of keys with lists of allowed values
     pub fn new(drain: D, level: slog::Level, mut filters: KVFilterList) -> Self {
+	    let fw = filters.iter()
+		    .map(|k, v| (k.as_str(), &v))
+		    .collect();
+
         KVFilter {
             drain: drain,
             level: level,
-            // Reverse the order as the logger exposes it's
-            // key-value pairs in reversed order
-            filters: filters.drain(..).rev().collect(),
+	        filters: filters,
+	        filters_flyweight: fw,
         }
     }
 
@@ -102,7 +106,7 @@ impl<D: slog::Drain> KVFilter<D> {
         // Can't use chaining here, as it's not possible to cast
         // SyncSerialize to Serialize
         let mut ser = FilteringSerializer {
-            pending_matches: &self.filters[..],
+	        pending_matches: self.filters_flyweight.clone(),
             tmp_str: String::new(),
         };
 
@@ -117,7 +121,7 @@ impl<D: slog::Drain> KVFilter<D> {
     }
 }
 
-impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
+impl<'a, D: slog::Drain> slog::Drain for KVFilter<'a, D> {
     type Err = D::Err;
     type Ok = Option<D::Ok>;
 
@@ -127,7 +131,7 @@ impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
 	       -> Result<Self::Ok, Self::Err> {
 		println!("{:#?}", info.msg());
 
-		if info.level() > self.level || self.is_match(info, logger_values) {
+		if info.level() < self.level || self.is_match(info, logger_values) {
             self.drain.log(info, logger_values).map(Some)
         } else {
             Ok(None)
@@ -215,7 +219,9 @@ mod tests {
 				                                                         "200".to_string()])),
 				                                ("direction".to_string(),
 				                                 HashSet::from_iter(vec!["send".to_string(),
-				                                                         "receive".to_string()]))]);
+				                                                         "receive".to_string()]))]
+					                           .into_iter()
+					                           .collect());
 
 				// Get a root logger that will log into a given drain.
 				let mainlog = Logger::root(filter.fuse(),
@@ -224,23 +230,27 @@ mod tests {
 				let subsublog = sublog.new(o!("direction" => "send"));
 				let subsubsublog = subsublog.new(o!());
 
-				let wrongthread = mainlog.new(o!("thread" => "100", "sub" => "sub"));
+				let wrongthread = mainlog.new(o!("thread" => "400", "sub" => "sub"));
 
-				info!(mainlog, "NO: filtered");
+				info!(mainlog, "NO: filtered, main, no keys");
 				info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
 				"thread" => "100", "direction" => "send");
-				warn!(mainlog, "YES: unfiltered"); // level high enough to pass anyway
+				info!(mainlog,
+				      "YES: unfiltered, on of thread matches, direction matches, different key order";
+				"direction" => "send", "thread" => "100");
 
-				debug!(mainlog, "NO: filtered"); // level too low
+				warn!(mainlog, "YES: unfiltered, higher level"); // level high enough to pass anyway
 
-				info!(mainlog, "NO: filtered";
+				debug!(mainlog, "NO: filtered, level to low, no keys"); // level low
+
+				info!(mainlog, "NO: filtered, wrong thread on record";
 				"thread" => "300", "direction" => "send");
 
-				info!(wrongthread, "NO: filtered");
+				info!(wrongthread, "NO: filtered, wrong thread on sublog");
 
-				info!(sublog, "NO: filtered sublog");
+				info!(sublog, "NO: filtered sublog, missing dirction ");
 
-				info!(sublog, "YES: unfiltered sublog";
+				info!(sublog, "YES: unfiltered sublog with added directoin";
 				"direction" => "receive");
 
 				info!(subsubsublog,
@@ -256,7 +266,7 @@ mod tests {
 				println!("resulting output: {:#?}", OUT);
 
 				if let Some(ref output) = OUT {
-					assert_eq!(output.len(), 5);
+					assert_eq!(output.len(), 6);
 				} else {
 					assert!(false);
 				}
