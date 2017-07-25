@@ -12,4 +12,4 @@ readme = "README.md"
 
 
 [dependencies]
-slog = "~2.0.0-3"
+slog = "2"
