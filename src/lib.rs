@@ -21,18 +21,22 @@ struct FilteringSerializer<'a> {
 
 impl<'a> slog::Serializer for FilteringSerializer<'a> {
     fn emit_arguments(&mut self, key: slog::Key, val: &fmt::Arguments) -> slog::Result {
-        if self.pending_matches.is_empty() {
-            return Ok(());
-        }
+	    if self.pending_matches.is_empty() {
+		    return Ok(());
+	    }
 
-	    if let Some(keyvalues) = self.pending_matches.get(&key) {
-            self.tmp_str.clear();
-            fmt::write(&mut self.tmp_str, *val)?;
+	    let matched = if let Some(keyvalues) = self.pending_matches.get(&key) {
+		    self.tmp_str.clear();
+		    fmt::write(&mut self.tmp_str, *val)?;
 
-		    if keyvalues.contains(&self.tmp_str) {
-			    self.pending_matches.remove(&key);
-            }
-        }
+		    keyvalues.contains(&self.tmp_str)
+	    } else {
+		    false
+	    };
+
+	    if matched {
+		    self.pending_matches.remove(&key);
+	    }
 
         Ok(())
     }
@@ -76,37 +80,35 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 /// Filtering in large systems that consist of multiple threads of same
 /// code or have functionality of interest spread across many components,
 /// modules, such as e.g. "sending packet" or "running FSM".
-pub struct KVFilter<'a, D: slog::Drain> {
+pub struct KVFilter<D: slog::Drain> {
     drain: D,
     filters: KVFilterList,
-	filters_flyweight: KVFilterListFlyWeight<'a>,
     level: slog::Level,
 }
 
-impl<'a, D: slog::Drain> KVFilter<'a, D> {
+impl<'a, D: slog::Drain> KVFilter<D> {
     /// Create `KVFilter`
     ///
     /// * `drain` - drain to be sent to
     /// * `level` - maximum level filtered, higher levels pass by
     /// * `filters` - Hashmap of keys with lists of allowed values
-    pub fn new(drain: D, level: slog::Level, mut filters: KVFilterList) -> Self {
-	    let fw = filters.iter()
-		    .map(|k, v| (k.as_str(), &v))
-		    .collect();
+    pub fn new(drain: D, level: slog::Level, filters: KVFilterList) -> Self {
 
         KVFilter {
-            drain: drain,
-            level: level,
+	        drain: drain,
+	        level: level,
 	        filters: filters,
-	        filters_flyweight: fw,
         }
     }
 
     fn is_match(&self, record: &slog::Record, logger_values: &slog::OwnedKVList) -> bool {
+
         // Can't use chaining here, as it's not possible to cast
         // SyncSerialize to Serialize
         let mut ser = FilteringSerializer {
-	        pending_matches: self.filters_flyweight.clone(),
+	        pending_matches: self.filters.iter()
+		        .map(|(k, v)| (k.as_str(), v))
+		        .collect(),
             tmp_str: String::new(),
         };
 
@@ -121,9 +123,9 @@ impl<'a, D: slog::Drain> KVFilter<'a, D> {
     }
 }
 
-impl<'a, D: slog::Drain> slog::Drain for KVFilter<'a, D> {
+impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
     type Err = D::Err;
-    type Ok = Option<D::Ok>;
+    type Ok = Option<D::Ok>;top
 
 	fn log(&self,
 	       info: &slog::Record,
