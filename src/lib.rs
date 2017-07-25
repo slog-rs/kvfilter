@@ -125,7 +125,7 @@ impl<'a, D: slog::Drain> KVFilter<D> {
 
 impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
     type Err = D::Err;
-    type Ok = Option<D::Ok>;top
+    type Ok = Option<D::Ok>;
 
 	fn log(&self,
 	       info: &slog::Record,
