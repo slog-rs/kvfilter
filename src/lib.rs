@@ -253,7 +253,7 @@ mod tests {
 			      "YES: unfiltered since one of the threads matches from inherited";
 			"direction" => "send");
 
-			println!("resulting output: {:#?}", out.lock().unwrap());
+			println!("resulting output: {:#?}", *out.lock().unwrap());
 
 			assert_eq!(out.lock().unwrap().len(), 6);
 
