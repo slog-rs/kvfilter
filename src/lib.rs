@@ -66,6 +66,7 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 /// With that the output for "receive" would be filtered.
 ///
 /// More precisely
+///
 ///   * a key is ignored until present in `KVFilterList`, otherwise an entry must
 ///     match for all the keys present in `KVFilterList` for any of the value given
 ///     for the key to pass the filter.
@@ -185,10 +186,6 @@ mod tests {
     /// get an asserting serializer, get a couple of loggers that
     /// have different nodes, components and see whether filtering
     /// is applied properly on the derived `Logger` copies
-    /// @note: unfortunately, ugly unsafe block needed to gather
-    ///        data for the test in the background over statics
-    ///        drain itself is being moved into the filter & then logger.
-    ///        cleaner would be some channel work but it's just a test.
     fn nodecomponentlogfilter() {
         {
             assert!(Level::Critical < Level::Warning);
