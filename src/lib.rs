@@ -1,7 +1,11 @@
 //! Filter records by matching some of their keys against a sets of values while allowing
 //! for records of level high enough to pass.
 
+#[cfg(test)]
 #[macro_use]
+extern crate slog;
+
+#[cfg(not(test))]
 extern crate slog;
 
 use std::collections::{HashSet, HashMap};
