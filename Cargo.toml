@@ -1,5 +1,5 @@
 [package]
-name = "kvfilter"
+name = "slog-kvfilter"
 version = "0.3.2-pre"
 authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
 description = "Key values based filter Drain for slog-rs"
