@@ -7,3 +7,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ## 0.4.0 - 2017-08-05
 
 * Fix name to `slog-kvfilter`
+
+## 0.4.1 - 2017-12-05
+
+* Added unittests
+* removed a println! bug 

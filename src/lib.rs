@@ -129,7 +129,7 @@ impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
            info: &slog::Record,
            logger_values: &slog::OwnedKVList)
            -> Result<Self::Ok, Self::Err> {
-        println!("{:#?}", info.msg());
+        // println!("{:#?}", info.msg());
 
         if info.level() < self.level || self.is_match(info, logger_values) {
             self.drain.log(info, logger_values).map(Some)
