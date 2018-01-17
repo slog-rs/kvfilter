@@ -22,4 +22,4 @@
 
 For more information, help, to report issues etc. see [slog-rs][slog-rs].
 
-[slog-rs]: //github.com/slog-rs/slog
+[slog-rs]: https://github.com/slog-rs/slog
