@@ -1,5 +1,6 @@
 //! Filter records by matching some of their keys against a sets of values while allowing
-//! for records of level high enough to pass.
+//! for records of level high enough to pass. It also can apply a negative filter after the
+//! positive filter to allow sophisticated 'hole-punching' into a matching category.
 
 #[cfg(test)]
 #[macro_use]
@@ -8,7 +9,7 @@ extern crate slog;
 #[cfg(not(test))]
 extern crate slog;
 
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::option::Option;
 
@@ -51,6 +52,8 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 
 /// `Drain` filtering records using list of keys and values they
 /// must have unless they are of a higher level than filtering applied.
+/// it can apply a negative filter as well that overrides any matches but
+/// will let higher level than filtering applied as well.
 ///
 /// This `Drain` filters a log entry on a filtermap
 /// that holds the key name in question and acceptable values
@@ -71,10 +74,16 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 ///
 /// More precisely
 ///
-///   * a key is ignored until present in `KVFilterList`, otherwise an entry must
-///     match for all the keys present in `KVFilterList` for any of the value given
+///   * a key is ignored until present in `filters`, otherwise an entry must
+///     match for all the keys present in `filters` for any of the values given
 ///     for the key to pass the filter.
-///   * Behavior on empty `KVFilterList` is undefined but normally anything should pass.
+///   * an entry that hits any value of any negative filter key is filtered, this
+///     takes precedence over `filters`
+///   * Behavior of empty `KVFilterList` is undefined but normally anything should pass.
+///   * Behavior of `KVFilter` that has same key in both the matching and the suppressing
+///     section is undefined even if we have different values there. Logically, it should
+///     be matching the positive and pass and only suppress negative if it finds matching
+///     value but it's untested.
 ///
 /// Usage
 /// =====
@@ -84,39 +93,77 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 /// modules, such as e.g. "sending packet" or "running FSM".
 pub struct KVFilter<D: slog::Drain> {
     drain: D,
-    filters: KVFilterList,
+    filters: Option<KVFilterList>,
+    neg_filters: Option<KVFilterList>,
     level: slog::Level,
 }
 
 impl<'a, D: slog::Drain> KVFilter<D> {
-    /// Create `KVFilter`
+    /// Create `KVFilter` letting e'thing pass unless filters are set. Anything more
+    /// important than `level` will pass in any case.
     ///
     /// * `drain` - drain to be sent to
     /// * `level` - maximum level filtered, higher levels pass by
-    /// * `filters` - Hashmap of keys with lists of allowed values
-    pub fn new(drain: D, level: slog::Level, filters: KVFilterList) -> Self {
+    pub fn new(drain: D, level: slog::Level) -> Self {
         KVFilter {
             drain: drain,
             level: level,
-            filters: filters,
+            filters: None,
+            neg_filters: None,
         }
+    }
+
+    /// pass through entries with all keys with _any_ of the matching values in its entries
+    pub fn only_pass_any_on_all_keys(mut self, filters: KVFilterList) -> Self {
+        self.filters = Some(filters);
+        self
+    }
+
+    /// suppress _any_ key with _any_ of the matching values in its entries.
+    /// This takes precedence over `only_pass_any`
+    pub fn always_suppress_any(mut self, filters: KVFilterList) -> Self {
+        self.neg_filters = Some(filters);
+        self
     }
 
     fn is_match(&self, record: &slog::Record, logger_values: &slog::OwnedKVList) -> bool {
         // Can't use chaining here, as it's not possible to cast
         // SyncSerialize to Serialize
         let mut ser = FilteringSerializer {
-            pending_matches: self.filters.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            pending_matches: self.filters.as_ref().map_or(HashMap::new(), |f| {
+                f.iter().map(|(k, v)| (k.as_str(), v)).collect()
+            }),
+            tmp_str: String::new(),
+        };
+
+        let mut negser = FilteringSerializer {
+            pending_matches: self.neg_filters.as_ref().map_or(HashMap::new(), |ref f| {
+                f.iter().map(|(k, v)| (k.as_str(), v)).collect()
+            }),
             tmp_str: String::new(),
         };
 
         record.kv().serialize(record, &mut ser).unwrap();
 
+        // negative we have to go all way down to check for _any_ key match
+        record.kv().serialize(record, &mut negser).unwrap();
+        logger_values.serialize(record, &mut negser).unwrap();
+
+        let anynegativematch =
+            negser.pending_matches.len() == self.neg_filters.as_ref().map_or(0, |m| m.keys().len());
+
         if ser.pending_matches.is_empty() {
-            return true;
+            // if e'thing matched on the positive make sure _nothing_ matched on negative
+            anynegativematch
         } else {
+            // check inside whether we find more matches
             logger_values.serialize(record, &mut ser).unwrap();
-            ser.pending_matches.is_empty()
+
+            if ser.pending_matches.is_empty() {
+                anynegativematch
+            } else {
+                false
+            }
         }
     }
 }
@@ -125,10 +172,11 @@ impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
     type Err = D::Err;
     type Ok = Option<D::Ok>;
 
-    fn log(&self,
-           info: &slog::Record,
-           logger_values: &slog::OwnedKVList)
-           -> Result<Self::Ok, Self::Err> {
+    fn log(
+        &self,
+        info: &slog::Record,
+        logger_values: &slog::OwnedKVList,
+    ) -> Result<Self::Ok, Self::Err> {
         // println!("{:#?}", info.msg());
 
         if info.level() < self.level || self.is_match(info, logger_values) {
@@ -142,7 +190,7 @@ impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
 #[cfg(test)]
 mod tests {
     use super::KVFilter;
-    use slog::{Level, Drain, Record, Logger, OwnedKVList};
+    use slog::{Drain, Level, Logger, OwnedKVList, Record};
     use std::collections::HashSet;
     use std::iter::FromIterator;
     use std::sync::Mutex;
@@ -186,73 +234,140 @@ mod tests {
         }
     }
 
+    fn testkvfilter<D: Drain>(d: D) -> KVFilter<D> {
+        KVFilter::new(d, Level::Info).only_pass_any_on_all_keys(
+            vec![
+                (
+                    "thread".to_string(),
+                    HashSet::from_iter(vec!["100".to_string(), "200".to_string()]),
+                ),
+                (
+                    "direction".to_string(),
+                    HashSet::from_iter(vec!["send".to_string(), "receive".to_string()]),
+                ),
+            ].into_iter()
+                .collect(),
+        )
+    }
+
+    fn testnegkvfilter<D: Drain>(f: KVFilter<D>) -> KVFilter<D> {
+        f.always_suppress_any(
+            vec![
+                (
+                    "deepcomp".to_string(),
+                    HashSet::from_iter(vec!["1".to_string(), "2".to_string()]),
+                ),
+                (
+                    "deepercomp".to_string(),
+                    HashSet::from_iter(vec!["4".to_string(), "5".to_string()]),
+                ),
+            ].into_iter()
+                .collect(),
+        )
+    }
+
     #[test]
-    /// get an asserting serializer, get a couple of loggers that
+    /// get an asserting Drain, get a couple of loggers that
     /// have different nodes, components and see whether filtering
     /// is applied properly on the derived `Logger` copies
     fn nodecomponentlogfilter() {
-        {
-            assert!(Level::Critical < Level::Warning);
+        assert!(Level::Critical < Level::Warning);
 
-            let out = Arc::new(Mutex::new(vec![]));
+        let out = Arc::new(Mutex::new(vec![]));
 
-            let drain = StringDrain { output: out.clone() };
+        let drain = StringDrain {
+            output: out.clone(),
+        };
 
-            // build some small filter
-            let filter = KVFilter::new(drain,
-                                       Level::Info,
-                                       vec![("thread".to_string(),
-                                             HashSet::from_iter(vec!["100".to_string(),
-                                                                     "200".to_string()])),
-                                            ("direction".to_string(),
-                                             HashSet::from_iter(vec!["send".to_string(),
-                                                                     "receive".to_string()]))]
-                                               .into_iter()
-                                               .collect());
+        // build some small filter
+        let filter = testkvfilter(drain);
 
-            // Get a root logger that will log into a given drain.
-            let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
-            let sublog = mainlog.new(o!("thread" => "200", "sub" => "sub"));
-            let subsublog = sublog.new(o!("direction" => "send"));
-            let subsubsublog = subsublog.new(o!());
+        // Get a root logger that will log into a given drain.
+        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+        let sublog = mainlog.new(o!("thread" => "200", "sub" => "sub"));
+        let subsublog = sublog.new(o!("direction" => "send"));
+        let subsubsublog = subsublog.new(o!());
 
-            let wrongthread = mainlog.new(o!("thread" => "400", "sub" => "sub"));
+        let wrongthread = mainlog.new(o!("thread" => "400", "sub" => "sub"));
 
-            info!(mainlog, "NO: filtered, main, no keys");
-            info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
-			"thread" => "100", "direction" => "send");
-            info!(mainlog,
-			      "YES: unfiltered, on of thread matches, direction matches, different key order";
-			"direction" => "send", "thread" => "100");
+        info!(mainlog, "NO: filtered, main, no keys");
+        info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
+        "thread" => "100", "direction" => "send");
+        info!(mainlog,
+              "YES: unfiltered, on of thread matches, direction matches, different key order";
+        "direction" => "send", "thread" => "100");
 
-            warn!(mainlog, "YES: unfiltered, higher level"); // level high enough to pass anyway
+        warn!(mainlog, "YES: unfiltered, higher level"); // level high enough to pass anyway
 
-            debug!(mainlog, "NO: filtered, level to low, no keys"); // level low
+        debug!(mainlog, "NO: filtered, level to low, no keys"); // level low
 
-            info!(mainlog, "NO: filtered, wrong thread on record";
-			"thread" => "300", "direction" => "send");
+        info!(mainlog, "NO: filtered, wrong thread on record";
+        "thread" => "300", "direction" => "send");
 
-            info!(wrongthread, "NO: filtered, wrong thread on sublog");
+        info!(wrongthread, "NO: filtered, wrong thread on sublog");
 
-            info!(sublog, "NO: filtered sublog, missing dirction ");
+        info!(sublog, "NO: filtered sublog, missing dirction ");
 
-            info!(sublog, "YES: unfiltered sublog with added directoin";
-			"direction" => "receive");
+        info!(sublog, "YES: unfiltered sublog with added directoin";
+        "direction" => "receive");
 
-            info!(subsubsublog,
-                  "YES: unfiltered subsubsublog, direction on subsublog, thread on sublog");
+        info!(
+            subsubsublog,
+            "YES: unfiltered subsubsublog, direction on subsublog, thread on sublog"
+        );
 
-            // test twice same keyword with right value will give filter match
-            let stackedthreadslog = wrongthread.new(o!("thread" => "200"));
+        // test twice same keyword with right value will give filter match
+        let stackedthreadslog = wrongthread.new(o!("thread" => "200"));
 
-            info!(stackedthreadslog,
-			      "YES: unfiltered since one of the threads matches from inherited";
-			"direction" => "send");
+        info!(stackedthreadslog,
+              "YES: unfiltered since one of the threads matches from inherited";
+        "direction" => "send");
 
-            println!("resulting output: {:#?}", *out.lock().unwrap());
+        println!("resulting output: {:#?}", *out.lock().unwrap());
 
-            assert_eq!(out.lock().unwrap().len(), 6);
+        assert_eq!(out.lock().unwrap().len(), 6);
+    }
 
-        }
+    #[test]
+    /// get an asserting Drain, get a couple of loggers that
+    /// have different nodes, components and deep/deeper components and see whether filtering
+    /// is applied properly on the derived `Logger` copies while punching holes for the disallowed
+    /// values
+    fn negnodecomponentlogfilter() {
+        assert!(Level::Critical < Level::Warning);
+
+        let out = Arc::new(Mutex::new(vec![]));
+
+        let drain = StringDrain {
+            output: out.clone(),
+        };
+
+        // build some small filter
+        let filter = testnegkvfilter(testkvfilter(drain));
+
+        // Get a root logger that will log into a given drain.
+        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+        let sublog = mainlog.new(o!("thread" => "200", "sub" => "sub"));
+        let subsublog = sublog.new(o!("direction" => "send"));
+        // deep match won't match
+        let subsubsublog = subsublog.new(o!("deepcomp" => "0"));
+        // deep match will filter
+        let negsubsubsublog = subsublog.new(o!("deepcomp" => "1"));
+
+        info!(mainlog, "NO: filtered, main, no keys");
+        info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
+        "thread" => "100", "direction" => "send");
+        info!(subsubsublog, "YES: unfiltered, on of thread matches, direction matches, deep doesn't apply";
+        "thread" => "100", "direction" => "send");
+        info!(negsubsubsublog, "NO: filtered, on of thread matches, direction matches, deep negative applies";
+        "thread" => "100", "direction" => "send");
+        info!(subsubsublog, "NO: filtered, on of thread matches, direction matches, deep doesn't apply but deeper does";
+        "thread" => "100", "direction" => "send", "deepercomp" => "4");
+        info!(subsubsublog, "YES: unfiltered, on of thread matches, direction matches, deep doesn't apply and deeper doesn't";
+        "thread" => "100", "direction" => "send", "deepercomp" => "7");
+
+        println!("resulting output: {:#?}", *out.lock().unwrap());
+
+        assert_eq!(out.lock().unwrap().len(), 3);
     }
 }
