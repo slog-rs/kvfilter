@@ -114,15 +114,17 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     }
 
     /// pass through entries with all keys with _any_ of the matching values in its entries
-    pub fn only_pass_any_on_all_keys(mut self, filters: KVFilterList) -> Self {
-        self.filters = Some(filters);
+    /// or ignore condition if None
+    pub fn only_pass_any_on_all_keys(mut self, filters: Option<KVFilterList>) -> Self {
+        self.filters = filters;
         self
     }
 
-    /// suppress _any_ key with _any_ of the matching values in its entries.
-    /// This takes precedence over `only_pass_any`
-    pub fn always_suppress_any(mut self, filters: KVFilterList) -> Self {
-        self.neg_filters = Some(filters);
+    /// suppress _any_ key with _any_ of the matching values in its entries or ignore
+    /// condition if None.
+    /// @note: This takes precedence over `only_pass_any`
+    pub fn always_suppress_any(mut self, filters: Option<KVFilterList>) -> Self {
+        self.neg_filters = filters;
         self
     }
 
@@ -235,7 +237,7 @@ mod tests {
     }
 
     fn testkvfilter<D: Drain>(d: D) -> KVFilter<D> {
-        KVFilter::new(d, Level::Info).only_pass_any_on_all_keys(
+        KVFilter::new(d, Level::Info).only_pass_any_on_all_keys(Some(
             vec![
                 (
                     "thread".to_string(),
@@ -247,11 +249,11 @@ mod tests {
                 ),
             ].into_iter()
                 .collect(),
-        )
+        ))
     }
 
     fn testnegkvfilter<D: Drain>(f: KVFilter<D>) -> KVFilter<D> {
-        f.always_suppress_any(
+        f.always_suppress_any(Some(
             vec![
                 (
                     "deepcomp".to_string(),
@@ -263,7 +265,7 @@ mod tests {
                 ),
             ].into_iter()
                 .collect(),
-        )
+        ))
     }
 
     #[test]
