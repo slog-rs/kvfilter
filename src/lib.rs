@@ -45,7 +45,7 @@ impl<'a> slog::Serializer for FilteringSerializer<'a> {
 }
 
 /// Must be a hashmap since we do not rely on ordered keys
-type KVFilterList = HashMap<String, HashSet<String>>;
+pub type KVFilterList = HashMap<String, HashSet<String>>;
 
 /// flyweight copy that is created upfront and given to every serializer
 type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
