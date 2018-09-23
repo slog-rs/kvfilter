@@ -1,7 +1,7 @@
 [package]
 name = "slog-kvfilter"
-version = "0.6.0"
-authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
+version = "0.6.1"
+authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>", "Tony Przygienda <prz@zeta2.ch>"]
 description = "Key values based filter Drain for slog-rs"
 keywords = ["slog", "logging", "log", "filter"]
 license = "MPL-2.0/MIT/Apache-2.0"
@@ -13,3 +13,4 @@ readme = "README.md"
 
 [dependencies]
 slog = "2"
+regex = "1"

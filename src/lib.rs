@@ -1,6 +1,8 @@
 //! Filter records by matching some of their keys against a sets of values while allowing
 //! for records of level high enough to pass. It also can apply a negative filter after the
-//! positive filter to allow sophisticated 'hole-punching' into a matching category.
+//! positive filter to allow sophisticated 'hole-punching' into a matching category. Ultimately,
+//! the resulting message (without keys and values) can be constrained by both presence of a regex
+//! or its absence.
 
 #[cfg(test)]
 #[macro_use]
@@ -9,11 +11,17 @@ extern crate slog;
 #[cfg(not(test))]
 extern crate slog;
 
+extern crate regex;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::option::Option;
+use std::panic::UnwindSafe;
+use std::panic::RefUnwindSafe;
+use std::fmt::format;
 
 use slog::KV;
+use regex::Regex;
 
 // @todo: must that be thread-safe?
 struct FilteringSerializer<'a> {
@@ -96,20 +104,27 @@ pub struct KVFilter<D: slog::Drain> {
     filters: Option<KVFilterList>,
     neg_filters: Option<KVFilterList>,
     level: slog::Level,
+    regex: Option<Regex>,
+    neg_regex: Option<Regex>,
 }
+
+impl<D: slog::Drain> UnwindSafe for KVFilter<D> {}
+impl<D: slog::Drain> RefUnwindSafe for KVFilter<D> {}
 
 impl<'a, D: slog::Drain> KVFilter<D> {
     /// Create `KVFilter` letting e'thing pass unless filters are set. Anything more
     /// important than `level` will pass in any case.
     ///
     /// * `drain` - drain to be sent to
-    /// * `level` - maximum level filtered, higher levels pass by
+    /// * `level` - maximum level filtered, higher levels pass by without filtering
     pub fn new(drain: D, level: slog::Level) -> Self {
         KVFilter {
             drain: drain,
             level: level,
             filters: None,
             neg_filters: None,
+            regex: None,
+            neg_regex: None,
         }
     }
 
@@ -125,6 +140,18 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     /// @note: This takes precedence over `only_pass_any`
     pub fn always_suppress_any(mut self, filters: Option<KVFilterList>) -> Self {
         self.neg_filters = filters;
+        self
+    }
+
+    /// only pass when this regex is found in the log message output.
+    pub fn only_pass_on_regex(mut self, regex: Regex) -> Self {
+        self.regex = Some(regex);
+        self
+    }
+
+    /// suppress output if this regex if found in the log message output.
+    pub fn always_suppress_on_regex(mut self, regex: Regex) -> Self {
+        self.neg_regex = Some(regex);
         self
     }
 
@@ -151,22 +178,40 @@ impl<'a, D: slog::Drain> KVFilter<D> {
         record.kv().serialize(record, &mut negser).unwrap();
         logger_values.serialize(record, &mut negser).unwrap();
 
-        let anynegativematch =
-            negser.pending_matches.len() == self.neg_filters.as_ref().map_or(0, |m| m.keys().len());
+        let anynegativematch = ||
+            negser.pending_matches.len() == self.neg_filters.as_ref()
+                .map_or(0,
+                        |m| m.keys().len());
 
-        if ser.pending_matches.is_empty() {
+        let mut pass = if ser.pending_matches.is_empty() {
             // if e'thing matched on the positive make sure _nothing_ matched on negative
-            anynegativematch
+            anynegativematch()
         } else {
             // check inside whether we find more matches
             logger_values.serialize(record, &mut ser).unwrap();
 
             if ser.pending_matches.is_empty() {
-                anynegativematch
+                anynegativematch()
             } else {
                 false
             }
+        };
+
+        if pass && (self.regex.is_some() || self.neg_regex.is_some()) {
+            let res = format(*record.msg());
+
+            if let Some(ref posmatch) = self.regex {
+                pass = posmatch.is_match(&res);
+            };
+
+            if pass {
+                if let Some(ref negmatch) = self.neg_regex {
+                    pass = !negmatch.is_match(&res);
+                }
+            }
         }
+
+        pass
     }
 }
 
@@ -193,6 +238,7 @@ impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
 mod tests {
     use super::KVFilter;
     use slog::{Drain, Level, Logger, OwnedKVList, Record};
+    use regex::Regex;
     use std::collections::HashSet;
     use std::iter::FromIterator;
     use std::sync::Mutex;
@@ -345,7 +391,7 @@ mod tests {
         };
 
         // build some small filter
-        let filter = testnegkvfilter(testkvfilter(drain));
+        let filter = testnegkvfilter(testkvfilter(drain.fuse()));
 
         // Get a root logger that will log into a given drain.
         let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
@@ -371,5 +417,35 @@ mod tests {
         println!("resulting output: {:#?}", *out.lock().unwrap());
 
         assert_eq!(out.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    /// test negative and positive
+    fn regextest() {
+        assert!(Level::Critical < Level::Warning);
+
+        let out = Arc::new(Mutex::new(vec![]));
+
+        let drain = StringDrain {
+            output: out.clone(),
+        };
+
+        // build some small filter
+        let filter = KVFilter::new(drain.fuse(), Level::Info)
+            .only_pass_on_regex(Regex::new(r"PASS\d:").unwrap())
+            .always_suppress_on_regex(Regex::new(r"NOPE\d:").unwrap());
+
+        // Get a root logger that will log into a given drain.
+        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+
+        info!(mainlog, "NO: filtered, no positive");
+        info!(mainlog, "NO: NOPE2 PASS0 filtered, negative");
+        info!(mainlog, "NO: filtered, no positive");
+        info!(mainlog, "YES: PASS2: not filtered, positive");
+        info!(mainlog, "YES: {}: not filtered, positive", "PASS4");
+
+        println!("resulting output: {:#?}", *out.lock().unwrap());
+
+        assert_eq!(out.lock().unwrap().len(), 2);
     }
 }
