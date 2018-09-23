@@ -12,3 +12,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 * Added unittests
 * removed a println! bug 
+
+## 0.6.1 - 2018-09-20
+
+* added regex filter to the API as well 
