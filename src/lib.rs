@@ -93,6 +93,11 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 ///     be matching the positive and pass and only suppress negative if it finds matching
 ///     value but it's untested.
 ///
+/// Additionally, the resulting message (without keys and values) can be constrained
+/// by both presence of a regex or its absence by applying the `only_pass_on_regex`
+/// and `always_suppress_on_regex` API calls. As the names suggest, suppression wins
+/// if both regex's are set.
+///
 /// Usage
 /// =====
 ///
