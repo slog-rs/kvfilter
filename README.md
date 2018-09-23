@@ -25,4 +25,4 @@ For more information, help, to report issues etc. see [slog-rs][slog-rs].
 [slog-rs]: https://github.com/slog-rs/slog
 
 Documentation can be found on 
-[`slog-kvfilter` type](https://docs.rs/slog-kvfilter/*/slog-kvfilter/index.html).
+[`slog-kvfilter` type](https://docs.rs/slog-kvfilter/).
