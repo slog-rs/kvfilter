@@ -149,14 +149,14 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     }
 
     /// only pass when this regex is found in the log message output.
-    pub fn only_pass_on_regex(mut self, regex: Regex) -> Self {
-        self.regex = Some(regex);
+    pub fn only_pass_on_regex(mut self, regex: Option<Regex>) -> Self {
+        self.regex = regex;
         self
     }
 
     /// suppress output if this regex if found in the log message output.
-    pub fn always_suppress_on_regex(mut self, regex: Regex) -> Self {
-        self.neg_regex = Some(regex);
+    pub fn always_suppress_on_regex(mut self, regex: Option<Regex>) -> Self {
+        self.neg_regex = regex;
         self
     }
 
@@ -437,8 +437,8 @@ mod tests {
 
         // build some small filter
         let filter = KVFilter::new(drain.fuse(), Level::Info)
-            .only_pass_on_regex(Regex::new(r"PASS\d:").unwrap())
-            .always_suppress_on_regex(Regex::new(r"NOPE\d:").unwrap());
+            .only_pass_on_regex(Some(Regex::new(r"PASS\d:").unwrap()))
+            .always_suppress_on_regex(Some(Regex::new(r"NOPE\d:").unwrap()));
 
         // Get a root logger that will log into a given drain.
         let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));

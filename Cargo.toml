@@ -1,6 +1,6 @@
 [package]
 name = "slog-kvfilter"
-version = "0.6.1"
+version = "0.7.0"
 authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>", "Tony Przygienda <prz@zeta2.ch>"]
 description = "Key values and Regex based filter Drain for slog-rs"
 keywords = ["slog", "logging", "log", "filter"]
@@ -9,7 +9,6 @@ documentation = "https://docs.rs/slog-kvfilter"
 homepage = "https://github.com/slog-rs/slog"
 repository = "https://github.com/slog-rs/kvfilter"
 readme = "README.md"
-
 
 [dependencies]
 slog = "2"
