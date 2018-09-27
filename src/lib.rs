@@ -91,6 +91,38 @@ impl FilterSpec {
         FilterSpec::And(Box::new(self), Box::new(other))
     }
 
+    /// Creates a filter that accepts if any of the variant accepts. Rejects on empty `variants` collection.
+    ///
+    /// variants are composed using foldr, that is [a, b, c] -> Or(a, Or(b, c))
+    pub fn any_of(variants: &[FilterSpec]) -> FilterSpec {
+        match variants.split_first() {
+            Some((head, tail)) => {
+                if tail.is_empty() {
+                    head.clone()
+                } else {
+                    head.clone().or(Self::any_of(tail))
+                }
+            }
+            None => FilterSpec::Reject
+        }
+    }
+
+    /// Creates a filter that accepts if all of the variants accept. Rejects on empty `variants` collection.
+    ///
+    /// variants are composed using foldr, that is [a, b, c] -> And(a, And(b, c))
+    pub fn all_of(variants: &[FilterSpec]) -> FilterSpec {
+        match variants.split_first() {
+            Some((head, tail)) => {
+                if tail.is_empty() {
+                    head.clone()
+                } else {
+                    head.clone().and(Self::all_of(tail))
+                }
+            }
+            None => FilterSpec::Reject
+        }
+    }
+
     pub fn or(self, other: FilterSpec) -> FilterSpec {
         FilterSpec::Or(Box::new(self), Box::new(other))
     }
@@ -246,18 +278,18 @@ impl<D> KVFilter<D> {
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -281,8 +313,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-where
-    D: Drain,
+    where
+        D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -594,6 +626,21 @@ mod tests {
     }
 
     #[test]
+    fn test_any_all_of() {
+        let a = FilterSpec::match_kv("k1", "v1");
+        let b = FilterSpec::match_kv("k2", "v2");
+        let c = FilterSpec::match_kv("k3", "v3");
+        assert_eq!(
+            a.clone().or(b.clone().or(c.clone())),
+            FilterSpec::any_of(&[a.clone(), b.clone(), c.clone()])
+        );
+        assert_eq!(
+            a.clone().and(b.clone().and(c.clone())),
+            FilterSpec::all_of(&[a.clone(), b.clone(), c.clone()])
+        );
+    }
+
+    #[test]
     fn test_lazy_format() {
         let filter_spec = FilterSpec::match_kv("sub_log_key", "sub_log_value")
             .or(FilterSpec::match_kv("key1", "value1"))
@@ -848,6 +895,8 @@ mod tests {
             .or(match_kv("neg_key2", "neg_value2b"));
 
         // We pass everything with level at least info, OR anything that matches the positive filter but not the negative one.
+        // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
+        // doesn't have to evaluate the more complicated rules if the simpler one already decides a message's fate
         let filter =
             FilterSpec::LevelAtLeast(Level::Info).or(positive_filter.and(negative_filter.not()));
 
@@ -886,14 +935,18 @@ mod tests {
 
         let subsystem_a = (match_kv("subsystem", "A1").or(match_kv("subsystem", "A2")))
             .and(FilterSpec::LevelAtLeast(Level::Debug));
+
         let subsystem_b = (match_kv("subsystem", "B1").or(match_kv("subsystem", "B2")))
             .and(FilterSpec::LevelAtLeast(Level::Info));
-        let filter = subsystem_a
-            .or(subsystem_b)
-            .or(FilterSpec::LevelAtLeast(Level::Warning));
+
+        // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
+        // doesn't have to evaluate the more complicated rules if the simpler one already decides a message's fate
+        let filter = FilterSpec::LevelAtLeast(Level::Warning)
+            .or(subsystem_a)
+            .or(subsystem_b);
 
         // EvaluationOrder::Logger means that only the logger KVs will be used for message filtering
-        let tester = Tester::new(filter, EvaluationOrder::Logger);
+        let tester = Tester::new(filter, EvaluationOrder::LoggerOnly);
         let subsystem_a1 = tester.log.new(o!("subsystem" => "A1"));
         let subsystem_a2 = tester.log.new(o!("subsystem" => "A2"));
         let subsystem_b1 = tester.log.new(o!("subsystem" => "B1"));
