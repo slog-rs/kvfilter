@@ -1,8 +1,7 @@
-//! Filter records by matching some of their keys against a sets of values while allowing
-//! for records of level high enough to pass. It also can apply a negative filter after the
-//! positive filter to allow sophisticated 'hole-punching' into a matching category. Ultimately,
-//! the resulting message (without keys and values) can be constrained by both presence of a regex
-//! or its absence.
+//! Filter records by matching their keys and values, and allows arbitrary
+//! Bool logic expressions to be used.
+//!
+//! See the unit tests (especially `test_complex_example`) to see how to use it.
 
 #[cfg(test)]
 #[macro_use]
@@ -11,446 +10,839 @@ extern crate slog;
 #[cfg(not(test))]
 extern crate slog;
 
-extern crate regex;
-
-use std::collections::{HashMap, HashSet};
+use slog::{Drain, Key, Level, OwnedKVList, Record, Serializer, KV};
+use std::cell::Cell;
 use std::fmt;
-use std::option::Option;
-use std::panic::UnwindSafe;
-use std::panic::RefUnwindSafe;
-use std::fmt::format;
 
-use slog::KV;
-use regex::Regex;
+// ========== public KVFilter configuration
 
-// @todo: must that be thread-safe?
-struct FilteringSerializer<'a> {
-    pending_matches: KVFilterListFlyWeight<'a>,
-    tmp_str: String,
+// TODO #derive Serde deserialize
+
+/// All the configuration for a KVFilter
+#[derive(Clone, Debug, PartialEq)]
+pub struct KVFilterConfig {
+    /// The specification of the filtering to be applied to the message. See the `FilterSpec` docs.
+    filter_spec: FilterSpec,
+    /// See the `EvaluationOrder` docs
+    evaluation_order: EvaluationOrder,
 }
 
-impl<'a> slog::Serializer for FilteringSerializer<'a> {
-    fn emit_arguments(&mut self, key: slog::Key, val: &fmt::Arguments) -> slog::Result {
-        if self.pending_matches.is_empty() {
-            return Ok(());
-        }
-
-        let matched = if let Some(keyvalues) = self.pending_matches.get(&key) {
-            self.tmp_str.clear();
-            fmt::write(&mut self.tmp_str, *val)?;
-
-            keyvalues.contains(&self.tmp_str)
-        } else {
-            false
-        };
-
-        if matched {
-            self.pending_matches.remove(&key);
-        }
-
-        Ok(())
-    }
-}
-
-/// Must be a hashmap since we do not rely on ordered keys
-pub type KVFilterList = HashMap<String, HashSet<String>>;
-
-/// flyweight copy that is created upfront and given to every serializer
-type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
-
-/// `Drain` filtering records using list of keys and values they
-/// must have unless they are of a higher level than filtering applied.
-/// it can apply a negative filter as well that overrides any matches but
-/// will let higher level than filtering applied as well.
+/// Specification of a filter. Filters are either simple filters like "Some Key and value must match this:",
+/// or compound filters like `And`, `Or` that are recursively composed from another filters.
 ///
-/// This `Drain` filters a log entry on a filtermap
-/// that holds the key name in question and acceptable values
-/// Key values are gathered up the whole hierarchy of inherited
-/// loggers.
-///
-/// Example
-/// =======
-///
-/// Logger( ... ; o!("thread" => "100");
-/// log( ... ; "packet" => "send");
-/// log( ... ; "packet" => "receive");
-///
-/// can be filtered on a map containing "thread" key component. If the
-/// values contain "100" the log will be output, otherwise filtered.
-/// The filtering map can contain further key "packet" and value "send".
-/// With that the output for "receive" would be filtered.
-///
-/// More precisely
-///
-///   * a key is ignored until present in `filters`, otherwise an entry must
-///     match for all the keys present in `filters` for any of the values given
-///     for the key to pass the filter.
-///   * an entry that hits any value of any negative filter key is filtered, this
-///     takes precedence over `filters`
-///   * Behavior of empty `KVFilterList` is undefined but normally anything should pass.
-///   * Behavior of `KVFilter` that has same key in both the matching and the suppressing
-///     section is undefined even if we have different values there. Logically, it should
-///     be matching the positive and pass and only suppress negative if it finds matching
-///     value but it's untested.
-///
-/// Additionally, the resulting message (without keys and values) can be constrained
-/// by both presence of a regex or its absence by applying the `only_pass_on_regex`
-/// and `always_suppress_on_regex` API calls. As the names suggest, suppression wins
-/// if both regex's are set.
-///
-/// Usage
-/// =====
-///
-/// Filtering in large systems that consist of multiple threads of same
-/// code or have functionality of interest spread across many components,
-/// modules, such as e.g. "sending packet" or "running FSM".
-pub struct KVFilter<D: slog::Drain> {
-    drain: D,
-    filters: Option<KVFilterList>,
-    neg_filters: Option<KVFilterList>,
-    level: slog::Level,
-    regex: Option<Regex>,
-    neg_regex: Option<Regex>,
-}
-
-impl<D: slog::Drain> UnwindSafe for KVFilter<D> {}
-impl<D: slog::Drain> RefUnwindSafe for KVFilter<D> {}
-
-impl<'a, D: slog::Drain> KVFilter<D> {
-    /// Create `KVFilter` letting e'thing pass unless filters are set. Anything more
-    /// important than `level` will pass in any case.
+/// See the tests for examples.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterSpec {
+    /// Always accept
+    Accept,
+    /// Always reject
+    Reject,
+    /// Accept when the key and value match the specification
+    MatchKV { key: String, value: String },
+    /// Accept when logging level is at least given treshold.
     ///
-    /// * `drain` - drain to be sent to
-    /// * `level` - maximum level filtered, higher levels pass by without filtering
-    pub fn new(drain: D, level: slog::Level) -> Self {
-        KVFilter {
-            drain: drain,
-            level: level,
-            filters: None,
-            neg_filters: None,
-            regex: None,
-            neg_regex: None,
+    /// Example: message with level *Warning* will pass `FilterSpec::LevelAtLeast(Info)`
+    LevelAtLeast(Level),
+    /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
+    ///
+    /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
+    /// `info!(log, "Msg"; "key1" => %value1, "key2" => %value2)` will first expand value2 and then value1.
+    And(Box<FilterSpec>, Box<FilterSpec>),
+    /// Accept when at least one of the sub-filters accepts. Sub-filter are evaluated left-to-right.
+    ///
+    /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
+    /// `info!(log, "Msg"; "key1" => %value1, "key2" => %value2)` will first expand value2 and then value1.
+    Or(Box<FilterSpec>, Box<FilterSpec>),
+    /// Turns an Accept into a Reject and vice versa.
+    Not(Box<FilterSpec>),
+}
+
+impl FilterSpec {
+    pub fn match_kv(key: impl ToString, value: impl ToString) -> FilterSpec {
+        FilterSpec::MatchKV {
+            key: key.to_string(),
+            value: value.to_string(),
         }
     }
 
-    /// pass through entries with all keys with _any_ of the matching values in its entries
-    /// or ignore condition if None
-    pub fn only_pass_any_on_all_keys(mut self, filters: Option<KVFilterList>) -> Self {
-        self.filters = filters;
-        self
+    pub fn and(self, other: FilterSpec) -> FilterSpec {
+        FilterSpec::And(Box::new(self), Box::new(other))
     }
 
-    /// suppress _any_ key with _any_ of the matching values in its entries or ignore
-    /// condition if None.
-    /// @note: This takes precedence over `only_pass_any`
-    pub fn always_suppress_any(mut self, filters: Option<KVFilterList>) -> Self {
-        self.neg_filters = filters;
-        self
+    pub fn or(self, other: FilterSpec) -> FilterSpec {
+        FilterSpec::Or(Box::new(self), Box::new(other))
     }
 
-    /// only pass when this regex is found in the log message output.
-    pub fn only_pass_on_regex(mut self, regex: Regex) -> Self {
-        self.regex = Some(regex);
-        self
+    pub fn not(self) -> FilterSpec {
+        FilterSpec::Not(Box::new(self))
+    }
+}
+
+/// Simple enum to express a message is to be either Accepted or Rejected
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AcceptOrReject {
+    Accept,
+    Reject,
+}
+
+/// The order of evaluation of message KVs and logger KVs
+///
+/// The keys and values to be logged come from two sources:
+///
+///  - some KVs are associated with the loggers, typically created with `new_log = log.new(o!("key": "value"))`
+///  - some KVs are associated with the logged messages, e. g. `info!(log, "message"; "key" => "value")`
+///
+/// Evaluation order allows us to specify, which KVs will be used for message filtering, and what order will be used.
+///
+/// I presume in practice `LoggerOnly` and `LoggerAndMessage` will be the most commonly used orders.
+///
+///  - `LoggerOnly` means that only KVs associated with the loggers will be used for message filtering
+///  - `LoggerAndMessage` means that first KVs associated with the loggers will be used for message filtering.
+/// If the filter isn't determined by the loggers KVs, message KVs will be used.
+///
+/// This can have both performance and semantics implications. If you are curious,
+/// see the comment at `KVFilter` for a more thorough discussion.
+///
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvaluationOrder {
+    LoggerOnly,
+    MessageOnly,
+    LoggerAndMessage,
+    MessageAndLogger,
+}
+
+/// The KVFilter itself. It implements `Drain`.
+///
+/// It passes messages matching the criteria specified by a given `config` into an underlying `drain`
+/// and discards the rest.
+/// ---
+/// The rest of this documentation is a little bit difficult, both for me as a writer and for the reader.
+/// I try to explain what happens under the hood when a message is being processed, and what performance
+/// implications it may have.
+///
+/// ## TL;DR: I try hard not to do any unnecessary work within the limits set by slog implementation.
+///
+/// ## Long version:
+///
+/// When a log message is to be processed, we obtain two KV sets from two sources:
+///
+///  - KVs associated with the loggers, typically created with `new_log = log.new(o!("key": "value"))`
+///  - KVs associated with the logged messages, e. g. `info!(log, "message"; "key" => "value")`
+///
+/// Each of the sets can be evaluated independently. Each KV set is evaluated in two stages:
+///
+///  ### 1. `kv_set.serialize(filtering_serializer)` is called for each KV set
+///
+/// This will eventually make `EvaluateFilterSerializer::emit_arguments`
+/// called for each Key and Value in the KV set.
+/// The important thing is that if there are any closures (`FnValue` and friends),
+/// **all** of the closures in the KV set will be called at this step.
+/// That means that if e. g. you don't need to filter on message KVs, just logger KVs
+/// is enough for you, you can save a some CPU by using `EvaluationOrder::LoggerOnly`. That will
+/// prevent the message closures from being called when a particular message is rejected based on logger KVs.
+/// Also, if you  use e. g. `EvaluationOrder::LoggerAndMessage` and  a particular message is resolved
+/// to be `Reject`-ed or `Accept`-ed early by just looking at the logger KV set, the message KV set will not
+/// be `serialize()`d because the result is already known.
+///
+/// ### 2. `EvaluateFilterSerializer::emit_arguments(key: String, value: std::fmt::Arguments)` gets called for each KV
+///
+/// The `value` parameter is not a String, but a ` std::fmt::Arguments`
+/// that needs to be turned into a String first so we can compare it to filters specified in the config.
+///
+/// We do two optimizations here:
+///
+/// a. Reuse the same String for expanding all the values to avoid some allocation
+///
+/// b. Only expand the value when we are not sure about the result yet. Again, if we don't need the value, because
+/// we already know a message will be Rejected or Accepted, we don't expand the value at all. Remember from
+/// bullet 1. that `kv_set.serialize(filtering_serializer)` will call `emit_arguments` with **all** the KVs from a
+/// particular set, so we try hard not do any unnecessary work with them when not needed.
+pub struct KVFilter<D> {
+    drain: D,
+    config: KVFilterConfig,
+}
+
+impl<D> KVFilter<D> {
+    pub fn new_from_config(drain: D, config: KVFilterConfig) -> Self {
+        KVFilter { drain, config }
     }
 
-    /// suppress output if this regex if found in the log message output.
-    pub fn always_suppress_on_regex(mut self, regex: Regex) -> Self {
-        self.neg_regex = Some(regex);
-        self
+    pub fn new(drain: D, filter_spec: FilterSpec, evaluation_order: EvaluationOrder) -> Self {
+        KVFilter {
+            drain,
+            config: KVFilterConfig {
+                filter_spec,
+                evaluation_order,
+            },
+        }
     }
 
-    fn is_match(&self, record: &slog::Record, logger_values: &slog::OwnedKVList) -> bool {
-        // Can't use chaining here, as it's not possible to cast
-        // SyncSerialize to Serialize
-        let mut ser = FilteringSerializer {
-            pending_matches: self.filters.as_ref().map_or(HashMap::new(), |f| {
-                f.iter().map(|(k, v)| (k.as_str(), v)).collect()
-            }),
-            tmp_str: String::new(),
+    fn is_match(&self, record: &Record, logger_values: &OwnedKVList) -> bool {
+        let mut evaluating_serializer = EvaluateFilterSerializer {
+            filter: Filter::from_spec(&self.config.filter_spec),
+            message_level: record.level(),
+            tmp_string: String::new(),
         };
 
-        let mut negser = FilteringSerializer {
-            pending_matches: self.neg_filters.as_ref().map_or(HashMap::new(), |ref f| {
-                f.iter().map(|(k, v)| (k.as_str(), v)).collect()
-            }),
-            tmp_str: String::new(),
-        };
+        macro_rules! serialize_and_return_if_decided {
+            ($kv: expr) => {
+                $kv
+                    .serialize(record, &mut evaluating_serializer)
+                    .unwrap(); // Is unwrap the right thing to do here?
 
-        record.kv().serialize(record, &mut ser).unwrap();
-
-        // negative we have to go all way down to check for _any_ key match
-        record.kv().serialize(record, &mut negser).unwrap();
-        logger_values.serialize(record, &mut negser).unwrap();
-
-        let anynegativematch = ||
-            negser.pending_matches.len() == self.neg_filters.as_ref()
-                .map_or(0,
-                        |m| m.keys().len());
-
-        let mut pass = if ser.pending_matches.is_empty() {
-            // if e'thing matched on the positive make sure _nothing_ matched on negative
-            anynegativematch()
-        } else {
-            // check inside whether we find more matches
-            logger_values.serialize(record, &mut ser).unwrap();
-
-            if ser.pending_matches.is_empty() {
-                anynegativematch()
-            } else {
-                false
-            }
-        };
-
-        if pass && (self.regex.is_some() || self.neg_regex.is_some()) {
-            let res = format(*record.msg());
-
-            if let Some(ref posmatch) = self.regex {
-                pass = posmatch.is_match(&res);
-            };
-
-            if pass {
-                if let Some(ref negmatch) = self.neg_regex {
-                    pass = !negmatch.is_match(&res);
+                match evaluating_serializer.filter {
+                    Filter::Accept => return true,
+                    Filter::Reject => return false,
+                    _ => {}
                 }
             }
         }
 
-        pass
+        match self.config.evaluation_order {
+            EvaluationOrder::LoggerOnly => {
+                serialize_and_return_if_decided!(logger_values);
+            }
+            EvaluationOrder::MessageOnly => {
+                serialize_and_return_if_decided!(record.kv());
+            }
+            EvaluationOrder::LoggerAndMessage => {
+                serialize_and_return_if_decided!(logger_values);
+                serialize_and_return_if_decided!(record.kv());
+            }
+            EvaluationOrder::MessageAndLogger => {
+                serialize_and_return_if_decided!(record.kv());
+                serialize_and_return_if_decided!(logger_values);
+            }
+        }
+
+        fn final_evaluate_filter(filter: &mut Filter, level: Level) -> AcceptOrReject {
+            match filter {
+                Filter::Accept => AcceptOrReject::Accept,
+                Filter::Reject => AcceptOrReject::Reject,
+                Filter::LevelAtLeast(treshold) => {
+                    if level.is_at_least(*treshold) {
+                        AcceptOrReject::Accept
+                    } else {
+                        AcceptOrReject::Reject
+                    }
+                }
+                Filter::MatchKV { .. } => AcceptOrReject::Reject,
+                Filter::And(a, b) => {
+                    if final_evaluate_filter(a, level) == AcceptOrReject::Accept
+                        && final_evaluate_filter(b, level) == AcceptOrReject::Accept
+                    {
+                        AcceptOrReject::Accept
+                    } else {
+                        AcceptOrReject::Reject
+                    }
+                }
+                Filter::Or(a, b) => {
+                    if final_evaluate_filter(a, level) == AcceptOrReject::Accept
+                        || final_evaluate_filter(b, level) == AcceptOrReject::Accept
+                    {
+                        AcceptOrReject::Accept
+                    } else {
+                        AcceptOrReject::Reject
+                    }
+                }
+                Filter::Not(f) => {
+                    if final_evaluate_filter(f, level) == AcceptOrReject::Accept {
+                        AcceptOrReject::Reject
+                    } else {
+                        AcceptOrReject::Accept
+                    }
+                }
+            }
+        }
+
+        let final_result = final_evaluate_filter(&mut evaluating_serializer.filter, record.level());
+
+        match final_result {
+            AcceptOrReject::Accept => true,
+            AcceptOrReject::Reject => false,
+        }
     }
 }
 
-impl<'a, D: slog::Drain> slog::Drain for KVFilter<D> {
-    type Err = D::Err;
+impl<D> Drain for KVFilter<D>
+where
+    D: Drain,
+{
     type Ok = Option<D::Ok>;
+    type Err = Option<D::Err>;
 
     fn log(
         &self,
-        info: &slog::Record,
+        record: &slog::Record,
         logger_values: &slog::OwnedKVList,
     ) -> Result<Self::Ok, Self::Err> {
-        // println!("{:#?}", info.msg());
-
-        if info.level() < self.level || self.is_match(info, logger_values) {
-            self.drain.log(info, logger_values).map(Some)
+        if self.is_match(record, logger_values) {
+            self.drain
+                .log(record, logger_values)
+                .map(Some)
+                .map_err(Some)
         } else {
             Ok(None)
         }
     }
 }
 
+// ========== Implementation
+
+/// An actual filter in progress that get's progressively simplified during a log message evaluation.
+/// A lightweight clone of FilterSpec.
+#[derive(Debug, PartialEq)]
+enum Filter<'a> {
+    Accept,
+    Reject,
+    MatchKV { key: &'a str, value: &'a str },
+    LevelAtLeast(Level),
+    And(Box<Filter<'a>>, Box<Filter<'a>>),
+    Or(Box<Filter<'a>>, Box<Filter<'a>>),
+    Not(Box<Filter<'a>>),
+}
+
+impl<'a> Filter<'a> {
+    fn from_spec<'b: 'a>(spec: &'b FilterSpec) -> Filter<'a> {
+        match spec {
+            FilterSpec::Accept => Filter::Accept,
+            FilterSpec::Reject => Filter::Reject,
+            FilterSpec::MatchKV { key, value } => Filter::MatchKV {
+                key: &key,
+                value: &value,
+            },
+            FilterSpec::LevelAtLeast(level) => Filter::LevelAtLeast(*level),
+            FilterSpec::And(a, b) => Filter::And(
+                Box::new(Filter::from_spec(&a)),
+                Box::new(Filter::from_spec(&b)),
+            ),
+            FilterSpec::Or(a, b) => Filter::Or(
+                Box::new(Filter::from_spec(&a)),
+                Box::new(Filter::from_spec(&b)),
+            ),
+            FilterSpec::Not(f) => Filter::Not(Box::new(Filter::from_spec(&f))),
+        }
+    }
+}
+
+/// Helper struct to turn arguments into a string and cache it.
+/// The actual cached string is passed around as `tmp_string` to
+/// the `is_equal` method. That is quite ugly, but I just didn't succeed adding a
+/// tmp_string: &'a mut String
+/// member to this struct and successfully negotiate its usage with the borrow checker.
+struct ArgumentsValueMemo<'a> {
+    arguments: &'a fmt::Arguments<'a>,
+    is_serialized: Cell<bool>,
+}
+
+impl<'a> ArgumentsValueMemo<'a> {
+    fn is_equal(&self, value: &str, tmp_string: &mut String) -> Result<bool, fmt::Error> {
+        if !self.is_serialized.get() {
+            tmp_string.clear();
+            fmt::write(tmp_string, *self.arguments)?;
+            self.is_serialized.set(true);
+        }
+        Ok(tmp_string == value)
+    }
+}
+
+/// This is the filtering workhorse. It used to process a single log message.
+/// It is set up with the logging level of the log message and a filter.
+/// `tmp_str` is there just to avoid repeated string allocation and serves as
+/// a temporary serialized string for `ArgumentsValueMemo`
+struct EvaluateFilterSerializer<'a> {
+    message_level: Level,
+    filter: Filter<'a>,
+    tmp_string: String,
+}
+
+impl<'a> Serializer for EvaluateFilterSerializer<'a> {
+    fn emit_arguments(&mut self, key: Key, value: &fmt::Arguments) -> slog::Result {
+        let mut value = ArgumentsValueMemo {
+            arguments: value,
+            is_serialized: Cell::new(false),
+        };
+
+        /// (Partially) in-place evaluate the filter for a particular key and value
+        fn evaluate_filter_with_kv(
+            filter: &mut Filter,
+            level: Level,
+            key: Key,
+            value: &mut ArgumentsValueMemo,
+            tmp_string: &mut String,
+        ) -> slog::Result {
+            let maybe_simplified_filter = match filter {
+                Filter::Accept => None,
+                Filter::Reject => None,
+                Filter::LevelAtLeast(treshold) => {
+                    if level.is_at_least(*treshold) {
+                        Some(Filter::Accept)
+                    } else {
+                        Some(Filter::Reject)
+                    }
+                }
+                Filter::MatchKV {
+                    key: this_key,
+                    value: this_value,
+                } => {
+                    if &key == this_key {
+                        if value.is_equal(this_value, tmp_string)? {
+                            Some(Filter::Accept)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Filter::And(a, b) => {
+                    evaluate_filter_with_kv(a, level, key, value, tmp_string)?;
+                    if **a == Filter::Reject {
+                        Some(Filter::Reject)
+                    } else {
+                        evaluate_filter_with_kv(b, level, key, value, tmp_string)?;
+                        if **a == Filter::Accept {
+                            if **b == Filter::Accept {
+                                Some(Filter::Accept)
+                            } else if **b == Filter::Reject {
+                                Some(Filter::Reject)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                }
+                Filter::Or(a, b) => {
+                    evaluate_filter_with_kv(a, level, key, value, tmp_string)?;
+                    if **a == Filter::Accept {
+                        Some(Filter::Accept)
+                    } else {
+                        evaluate_filter_with_kv(b, level, key, value, tmp_string)?;
+                        if **b == Filter::Accept {
+                            Some(Filter::Accept)
+                        } else if **a == Filter::Reject && **b == Filter::Reject {
+                            Some(Filter::Reject)
+                        } else {
+                            None
+                        }
+                    }
+                }
+                Filter::Not(f) => {
+                    evaluate_filter_with_kv(f, level, key, value, tmp_string)?;
+                    if **f == Filter::Accept {
+                        Some(Filter::Reject)
+                    } else if **f == Filter::Reject {
+                        Some(Filter::Accept)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(simplified_filter) = maybe_simplified_filter {
+                *filter = simplified_filter
+            }
+
+            Ok(())
+        }
+
+        evaluate_filter_with_kv(
+            &mut self.filter,
+            self.message_level,
+            key,
+            &mut value,
+            &mut self.tmp_string,
+        )?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::KVFilter;
-    use slog::{Drain, Level, Logger, OwnedKVList, Record};
-    use regex::Regex;
-    use std::collections::HashSet;
-    use std::iter::FromIterator;
-    use std::sync::Mutex;
-    use std::fmt::Display;
-    use std::fmt::Formatter;
-    use std::fmt::Result as FmtResult;
-    use std::io;
-    use std::sync::Arc;
+    use super::FilterSpec::*;
+    use super::*;
 
-    const YES: &'static str = "YES";
-    const NO: &'static str = "NO";
+    use std::fmt;
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use slog::{Drain, FnValue, Level, Logger, OwnedKVList, Record};
 
     #[derive(Debug)]
     struct StringDrain {
         output: Arc<Mutex<Vec<String>>>,
     }
 
-    /// seriously hacked logger drain that just counts messages to make
-    /// sure we have tests behaving correcly
     impl<'a> Drain for StringDrain {
-        type Err = io::Error;
         type Ok = ();
+        type Err = io::Error;
 
-        fn log(&self, info: &Record, _: &OwnedKVList) -> io::Result<()> {
-            let mut lo = self.output.lock().unwrap();
-            let fmt = format!("{:?}", info.msg());
-
-            if !fmt.contains(YES) && !fmt.contains(NO) {
-                panic!(fmt);
+        fn log(&self, message: &Record, _: &OwnedKVList) -> io::Result<()> {
+            let formatted = format!("{:?}", message.msg());
+            if !formatted.contains("ACCEPT") && !formatted.contains("REJECT") {
+                panic!(formatted);
             }
 
-            (*lo).push(fmt);
+            self.output.lock().unwrap().push(formatted);
 
             Ok(())
         }
     }
 
-    impl<'a> Display for StringDrain {
-        fn fmt(&self, f: &mut Formatter) -> FmtResult {
-            write!(f, "none")
+    impl<'a> fmt::Display for StringDrain {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "String drain: {:#?}", self.output.lock().unwrap())
         }
     }
 
-    fn testkvfilter<D: Drain>(d: D) -> KVFilter<D> {
-        KVFilter::new(d, Level::Info).only_pass_any_on_all_keys(Some(
-            vec![
-                (
-                    "thread".to_string(),
-                    HashSet::from_iter(vec!["100".to_string(), "200".to_string()]),
-                ),
-                (
-                    "direction".to_string(),
-                    HashSet::from_iter(vec!["send".to_string(), "receive".to_string()]),
-                ),
-            ].into_iter()
-                .collect(),
-        ))
+    /// A message that adds the message into the formatted_messages Vec as a side-effect of debug format
+    struct TestingMessage {
+        message: String,
+        increment_on_format: Arc<AtomicUsize>,
     }
 
-    fn testnegkvfilter<D: Drain>(f: KVFilter<D>) -> KVFilter<D> {
-        f.always_suppress_any(Some(
-            vec![
-                (
-                    "deepcomp".to_string(),
-                    HashSet::from_iter(vec!["1".to_string(), "2".to_string()]),
-                ),
-                (
-                    "deepercomp".to_string(),
-                    HashSet::from_iter(vec!["4".to_string(), "5".to_string()]),
-                ),
-            ].into_iter()
-                .collect(),
-        ))
+    impl TestingMessage {
+        fn new(message: &str, increment_on_format: &Arc<AtomicUsize>) -> Self {
+            TestingMessage {
+                message: message.to_owned(),
+                increment_on_format: Arc::clone(increment_on_format),
+            }
+        }
+    }
+
+    impl fmt::Debug for TestingMessage {
+        fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+            self.increment_on_format.fetch_add(1, Ordering::Relaxed);
+            write!(f, "{}", self.message)
+        }
+    }
+
+    struct Tester {
+        accepted_messages: Arc<Mutex<Vec<String>>>,
+        evaluated_log_values: Arc<AtomicUsize>,
+        log: Logger,
+    }
+
+    impl Tester {
+        fn new(filter_spec: FilterSpec, evaluation_order: EvaluationOrder) -> Self {
+            let accepted_messages = Arc::new(Mutex::new(Vec::new()));
+            let evaluated_log_values = Arc::new(AtomicUsize::new(0));
+            let evaluated_log_values_clone = Arc::clone(&evaluated_log_values);
+            let drain = StringDrain {
+                output: accepted_messages.clone(),
+            };
+            let filter = KVFilter::new(drain, filter_spec, evaluation_order);
+            let log = Logger::root(
+                filter.fuse(),
+                o!("main_log" => FnValue(move |_: &Record| {
+                evaluated_log_values_clone.fetch_add(1, Ordering::Relaxed);
+                "m"
+            })),
+            );
+
+            Tester {
+                accepted_messages,
+                evaluated_log_values,
+                log,
+            }
+        }
+
+        fn assert_accepted(&self, expected_count: usize) {
+            let accepted_messages = self.accepted_messages.lock().unwrap();
+            for message in accepted_messages.iter() {
+                assert!(
+                    message.contains("ACCEPT"),
+                    "Message without ACCEPT accepted: `{}`",
+                    message
+                )
+            }
+            let actual_count = accepted_messages.len();
+            assert_eq!(expected_count, actual_count)
+        }
+
+        fn assert_evaluated_log_values(&self, expected_count: usize) {
+            let actual_count = self.evaluated_log_values.load(Ordering::Relaxed);
+            assert_eq!(expected_count, actual_count)
+        }
     }
 
     #[test]
-    /// get an asserting Drain, get a couple of loggers that
-    /// have different nodes, components and see whether filtering
-    /// is applied properly on the derived `Logger` copies
-    fn nodecomponentlogfilter() {
-        assert!(Level::Critical < Level::Warning);
+    fn test_lazy_format() {
+        let filter_spec = FilterSpec::match_kv("sub_log_key", "sub_log_value")
+            .or(FilterSpec::match_kv("key1", "value1"))
+            .or(FilterSpec::match_kv("key2", "value2"));
 
-        let out = Arc::new(Mutex::new(vec![]));
+        let tester = Tester::new(filter_spec, EvaluationOrder::LoggerAndMessage);
 
-        let drain = StringDrain {
-            output: out.clone(),
+        let value1_evaluations = Arc::new(AtomicUsize::new(0));
+        let value1 = TestingMessage::new("value1", &value1_evaluations);
+        let value2_evaluations = Arc::new(AtomicUsize::new(0));
+        let value2 = TestingMessage::new("value2", &value2_evaluations);
+        let invalid_value_evaluations = Arc::new(AtomicUsize::new(0));
+        let invalid_value = TestingMessage::new("invalid", &invalid_value_evaluations);
+
+        let assert_evaluations = |value1: usize, value2: usize, invalid: usize| {
+            assert_eq!(value1, value1_evaluations.load(Ordering::Relaxed));
+            value1_evaluations.store(0, Ordering::Relaxed);
+            assert_eq!(value2, value2_evaluations.load(Ordering::Relaxed));
+            value2_evaluations.store(0, Ordering::Relaxed);
+            assert_eq!(invalid, invalid_value_evaluations.load(Ordering::Relaxed));
+            invalid_value_evaluations.store(0, Ordering::Relaxed);
         };
 
-        // build some small filter
-        let filter = testkvfilter(drain);
+        let sub_log = tester.log.new(o!("sub_log_key" => "sub_log_value"));
+        info!(sub_log, "ACCEPT because of sub_log_key"; "key1" => ?value1);
+        assert_evaluations(0, 0, 0);
 
-        // Get a root logger that will log into a given drain.
-        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
-        let sublog = mainlog.new(o!("thread" => "200", "sub" => "sub"));
-        let subsublog = sublog.new(o!("direction" => "send"));
-        let subsubsublog = subsublog.new(o!());
+        info!(tester.log, "ACCEPT because of key1"; "key1" => ?value1);
+        assert_evaluations(1, 0, 0);
 
-        let wrongthread = mainlog.new(o!("thread" => "400", "sub" => "sub"));
+        info!(tester.log, "ACCEPT because of key1"; "key1" => ?value1);
+        assert_evaluations(1, 0, 0);
 
-        info!(mainlog, "NO: filtered, main, no keys");
-        info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
-        "thread" => "100", "direction" => "send");
-        info!(mainlog,
-              "YES: unfiltered, on of thread matches, direction matches, different key order";
-        "direction" => "send", "thread" => "100");
+        info!(tester.log, "ACCEPT because of key2"; "key2" => ?value2);
+        assert_evaluations(0, 1, 0);
 
-        warn!(mainlog, "YES: unfiltered, higher level"); // level high enough to pass anyway
-
-        debug!(mainlog, "NO: filtered, level to low, no keys"); // level low
-
-        info!(mainlog, "NO: filtered, wrong thread on record";
-        "thread" => "300", "direction" => "send");
-
-        info!(wrongthread, "NO: filtered, wrong thread on sublog");
-
-        info!(sublog, "NO: filtered sublog, missing dirction ");
-
-        info!(sublog, "YES: unfiltered sublog with added directoin";
-        "direction" => "receive");
-
-        info!(
-            subsubsublog,
-            "YES: unfiltered subsubsublog, direction on subsublog, thread on sublog"
+        // Slog processes KVs in reverse order. If this ever changes, please update the relevant documentation for FilterSpec.
+        info!(tester.log,
+            "ACCEPT because of key1, don't process key2.";
+            "key2" => ?invalid_value, "key1" => ?value1
         );
+        assert_evaluations(1, 0, 0);
 
-        // test twice same keyword with right value will give filter match
-        let stackedthreadslog = wrongthread.new(o!("thread" => "200"));
+        info!(tester.log,
+          "ACCEPT because of key2, key1 had to be processed first with negative result.";
+          "key2" => ?value2, "key1" => ?invalid_value
+        );
+        assert_evaluations(0, 1, 1);
 
-        info!(stackedthreadslog,
-              "YES: unfiltered since one of the threads matches from inherited";
-        "direction" => "send");
+        info!(tester.log, "REJECT"; "key2" => ?invalid_value, "key1" => ?invalid_value );
+        assert_evaluations(0, 0, 2);
 
-        println!("resulting output: {:#?}", *out.lock().unwrap());
-
-        assert_eq!(out.lock().unwrap().len(), 6);
+        tester.assert_evaluated_log_values(7);
+        tester.assert_accepted(6);
     }
 
     #[test]
-    /// get an asserting Drain, get a couple of loggers that
-    /// have different nodes, components and deep/deeper components and see whether filtering
-    /// is applied properly on the derived `Logger` copies while punching holes for the disallowed
-    /// values
-    fn negnodecomponentlogfilter() {
-        assert!(Level::Critical < Level::Warning);
+    fn test_evaluation_order() {
+        fn new_tester(evaluation_order: EvaluationOrder) -> Tester {
+            Tester::new(
+                FilterSpec::match_kv("key", "value").or(FilterSpec::match_kv("sub_log", "a")),
+                evaluation_order,
+            )
+        }
 
-        let out = Arc::new(Mutex::new(vec![]));
+        {
+            let tester = new_tester(EvaluationOrder::LoggerOnly);
+            let sub_log = tester.log.new(o!("sub_log" => "a"));
 
-        let drain = StringDrain {
-            output: out.clone(),
-        };
+            info!(sub_log, "ACCEPT: Will be accepted because of sub log");
+            tester.assert_accepted(1);
+            info!(tester.log, "REJECT: Won't be accepted because message KVs are not evaluated"; "key" => "value");
+            tester.assert_accepted(1);
+            tester.assert_evaluated_log_values(2);
+        }
 
-        // build some small filter
-        let filter = testnegkvfilter(testkvfilter(drain.fuse()));
+        {
+            let tester = new_tester(EvaluationOrder::MessageOnly);
+            let sub_log = tester.log.new(o!("sub_log" => "a"));
 
-        // Get a root logger that will log into a given drain.
-        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
-        let sublog = mainlog.new(o!("thread" => "200", "sub" => "sub"));
-        let subsublog = sublog.new(o!("direction" => "send"));
-        // deep match won't match
-        let subsubsublog = subsublog.new(o!("deepcomp" => "0"));
-        // deep match will filter
-        let negsubsubsublog = subsublog.new(o!("deepcomp" => "1"));
+            info!(
+                sub_log,
+                "REJECT: Will be rejected because log KVs are ignored"
+            );
+            tester.assert_accepted(0);
+            info!(tester.log, "ACCEPT"; "key" => "value");
+            tester.assert_accepted(1);
+            tester.assert_evaluated_log_values(0);
+        }
 
-        info!(mainlog, "NO: filtered, main, no keys");
-        info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
-        "thread" => "100", "direction" => "send");
-        info!(subsubsublog, "YES: unfiltered, on of thread matches, direction matches, deep doesn't apply";
-        "thread" => "100", "direction" => "send");
-        info!(negsubsubsublog, "NO: filtered, on of thread matches, direction matches, deep negative applies";
-        "thread" => "100", "direction" => "send");
-        info!(subsubsublog, "NO: filtered, on of thread matches, direction matches, deep doesn't apply but deeper does";
-        "thread" => "100", "direction" => "send", "deepercomp" => "4");
-        info!(subsubsublog, "YES: unfiltered, on of thread matches, direction matches, deep doesn't apply and deeper doesn't";
-        "thread" => "100", "direction" => "send", "deepercomp" => "7");
+        {
+            let tester = new_tester(EvaluationOrder::LoggerAndMessage);
+            let sub_log = tester.log.new(o!("sub_log" => "a"));
 
-        println!("resulting output: {:#?}", *out.lock().unwrap());
+            info!(tester.log, "ACCEPT"; "key" => "value");
+            info!(sub_log, "ACCEPT: Will be accepted because of sub log");
+            tester.assert_accepted(2);
+            tester.assert_evaluated_log_values(2);
+        }
 
-        assert_eq!(out.lock().unwrap().len(), 3);
+        {
+            let tester = new_tester(EvaluationOrder::MessageAndLogger);
+            let sub_log = tester.log.new(o!("sub_log" => "a"));
+
+            info!(tester.log, "ACCEPT"; "key" => "value");
+            info!(sub_log, "ACCEPT: Will be accepted because of sub log");
+            tester.assert_accepted(2);
+            tester.assert_evaluated_log_values(1);
+        }
     }
 
     #[test]
-    /// test negative and positive
-    fn regextest() {
-        assert!(Level::Critical < Level::Warning);
+    fn test_sub_log() {
+        {
+            let tester = Tester::new(
+                FilterSpec::match_kv("main_log", "m"),
+                EvaluationOrder::LoggerAndMessage,
+            );
+            let sub_log = tester.log.new(o!("sub_log" => "a"));
+            let sub_sub_log = sub_log.new(o!("sub_sub_log" => "b"));
 
-        let out = Arc::new(Mutex::new(vec![]));
+            info!(tester.log, "ACCEPT: main log");
+            info!(sub_log, "ACCEPT: sub log inherits the main_log KV");
+            info!(sub_sub_log, "ACCEPT: the same for sub sub log");
+            tester.assert_accepted(3);
+        }
 
-        let drain = StringDrain {
-            output: out.clone(),
-        };
+        {
+            let tester = Tester::new(
+                FilterSpec::match_kv("sub_sub_log", "b"),
+                EvaluationOrder::LoggerAndMessage,
+            );
+            let sub_log = tester.log.new(o!("sub_log" => "a"));
+            let sub_sub_log = sub_log.new(o!("sub_sub_log" => "b"));
 
-        // build some small filter
-        let filter = KVFilter::new(drain.fuse(), Level::Info)
-            .only_pass_on_regex(Regex::new(r"PASS\d:").unwrap())
-            .always_suppress_on_regex(Regex::new(r"NOPE\d:").unwrap());
+            info!(
+                tester.log,
+                "REJECT: main log doesn't have the sub_sub_log key"
+            );
+            info!(sub_log, "REJECT: neither has the sub_log");
+            info!(sub_sub_log, "ACCEPT: sub sub log has it");
+            tester.assert_accepted(1);
+        }
+    }
 
-        // Get a root logger that will log into a given drain.
-        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+    #[test]
+    fn test_accept() {
+        let tester = Tester::new(Accept, EvaluationOrder::LoggerAndMessage);
+        info!(tester.log, "ACCEPT: Everything will pass");
+        warn!(tester.log, "ACCEPT: Everything will pass");
+        tester.assert_accepted(2);
+    }
 
-        info!(mainlog, "NO: filtered, no positive");
-        info!(mainlog, "NO: NOPE2 PASS0 filtered, negative");
-        info!(mainlog, "NO: filtered, no positive");
-        info!(mainlog, "YES: PASS2: not filtered, positive");
-        info!(mainlog, "YES: {}: not filtered, positive", "PASS4");
+    #[test]
+    fn test_reject() {
+        let tester = Tester::new(Reject, EvaluationOrder::LoggerAndMessage);
+        info!(tester.log, "REJECT: Everything will be rejected");
+        warn!(tester.log, "REJECT: Everything will be rejected");
+        tester.assert_accepted(0);
+    }
 
-        println!("resulting output: {:#?}", *out.lock().unwrap());
+    #[test]
+    fn test_level_at_least() {
+        let tester = Tester::new(
+            LevelAtLeast(Level::Warning),
+            EvaluationOrder::LoggerAndMessage,
+        );
+        info!(tester.log, "REJECT: Level too low");
+        warn!(tester.log, "ACCEPT: Level good");
+        error!(tester.log, "ACCEPT: Level good");
+        tester.assert_accepted(2);
+    }
 
-        assert_eq!(out.lock().unwrap().len(), 2);
+    #[test]
+    fn test_match_kv() {
+        let tester = Tester::new(
+            FilterSpec::match_kv("key", "value"),
+            EvaluationOrder::LoggerAndMessage,
+        );
+        info!(tester.log, "ACCEPT: Good key"; "key" => "value");
+        info!(tester.log, "REJECT"; "main_log" => "m");
+        info!(tester.log, "REJECT"; "key" => "bad_value");
+        info!(tester.log, "REJECT"; "bad_key" => "value");
+        tester.assert_accepted(1);
+    }
+
+    #[test]
+    fn test_and() {
+        {
+            let tester = Tester::new(
+                FilterSpec::match_kv("key1", "value1").and(FilterSpec::match_kv("key2", "value2")),
+                EvaluationOrder::LoggerAndMessage,
+            );
+            info!(tester.log, "ACCEPT"; "key1" => "value1", "key2" => "value2");
+            info!(tester.log, "REJECT: key1"; "key1" => "value1");
+            info!(tester.log, "REJECT: key1"; "key1" => "value1", "key2" => "boo");
+            info!(tester.log, "REJECT: key2"; "key2" => "value2");
+            info!(tester.log, "REJECT: key2"; "key1" => "boo", "key2" => "value2");
+            info!(tester.log, "REJECT"; "key1" => "boo", "key2" => "boo");
+            tester.assert_accepted(1);
+        }
+    }
+
+    #[test]
+    fn test_or() {
+        {
+            let tester = Tester::new(
+                FilterSpec::match_kv("key1", "value1").or(FilterSpec::match_kv("key2", "value2")),
+                EvaluationOrder::LoggerAndMessage,
+            );
+            info!(tester.log, "ACCEPT: key1"; "key1" => "value1");
+            info!(tester.log, "ACCEPT: key1"; "key1" => "value1", "key2" => "boo");
+            info!(tester.log, "ACCEPT: key2"; "key2" => "value2");
+            info!(tester.log, "ACCEPT: key2"; "key1" => "boo", "key2" => "value2");
+            info!(tester.log, "REJECT"; "key1" => "boo", "key2" => "boo");
+            tester.assert_accepted(4);
+        }
+    }
+
+    #[test]
+    fn test_not() {
+        {
+            let tester = Tester::new(
+                FilterSpec::match_kv("key1", "value1").not(),
+                EvaluationOrder::LoggerAndMessage,
+            );
+            info!(tester.log, "REJECT: key1 match was turned into negative"; "key1" => "value1");
+            info!(tester.log, "ACCEPT: No match, we turn it into a negative, that is Accept"; "key1" => "boo");
+            tester.assert_accepted(1);
+        }
+    }
+
+    #[test]
+    fn test_complex_example() {
+        // This is an example that mimics the original KVFilter.
+        // We express the following example filter:
+        // KVFilter {
+        //   filters: key1 -> [value1a, value1b], key2 -> [value2]
+        //   neg_filters: neg_key1 -> [neg_value1], neg_key2 -> [neg_value2a, neg_value2b]
+        //   level: Debug (that actually means level at least Info)
+        // }
+
+        let match_kv = FilterSpec::match_kv;
+
+        // (key1 must be either value1a or value1b) AND key2 must be value2
+        let positive_filter = (match_kv("key1", "value1a").or(match_kv("key1", "value1b")))
+            .and(match_kv("key2", "value2"));
+
+        // neg_key1 must be neg_value1 OR neg_key2 must be neg_value2a OR neg_key2 must be neg_value2b
+        let negative_filter = match_kv("neg_key1", "neg_value1")
+            .or(match_kv("neg_key2", "neg_value2a"))
+            .or(match_kv("neg_key2", "neg_value2b"));
+
+        // We pass everything with level at least info, OR anything that matches the positive filter but not the negative one.
+        let filter =
+            FilterSpec::LevelAtLeast(Level::Info).or(positive_filter.and(negative_filter.not()));
+
+        let tester = Tester::new(filter, EvaluationOrder::LoggerAndMessage);
+
+        info!(tester.log, "ACCEPT: Info level");
+        debug!(tester.log, "REJECT 1: Level too low");
+        debug!(tester.log, "ACCEPT"; "key1" => "value1a", "key2" => "value2");
+        debug!(tester.log, "ACCEPT"; "key1" => "value1b", "key2" => "value2");
+        debug!(tester.log, "REJECT 2"; "key1" => "invalid", "key2" => "value2");
+        debug!(tester.log, "REJECT 3"; "key1" => "value1b", "key2" => "invalid");
+        debug!(tester.log, "REJECT 4"; "invalid" => "value1b", "key2" => "value2");
+        debug!(tester.log, "REJECT 5"; "invalid" => "value1b", "key2" => "value2");
+        debug!(tester.log, "REJECT 6"; "key1" => "value1a", "key2" => "value2", "neg_key1" => "neg_value1");
+        debug!(tester.log, "REJECT 7"; "key1" => "value1a", "key2" => "value2", "neg_key2" => "neg_value2b");
+        debug!(tester.log, "ACCEPT"; "key1" => "value1a", "key2" => "value2", "neg_key1" => "invalid");
+
+        tester.assert_accepted(4);
     }
 }
+
