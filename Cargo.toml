@@ -10,7 +10,10 @@ homepage = "https://github.com/slog-rs/slog"
 repository = "https://github.com/slog-rs/kvfilter"
 readme = "README.md"
 
+[features]
+default=["serde"]
 
 [dependencies]
+serde = { version = "1", optional = true, features = ["derive"] }
 slog = "2"
 regex = "1"

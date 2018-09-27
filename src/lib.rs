@@ -1,7 +1,12 @@
 //! Filter records by matching their keys and values, and allows arbitrary
 //! Bool logic expressions to be used.
 //!
-//! See the unit tests (especially `test_complex_example`) to see how to use it.
+//! See the unit tests (especially `test_complex_example` and `test_complex_example_2`) to see how to use it.
+//!
+
+#[cfg(feature = "serde")]
+#[macro_use]
+extern crate serde;
 
 #[cfg(test)]
 #[macro_use]
@@ -16,9 +21,10 @@ use std::fmt;
 
 // ========== public KVFilter configuration
 
-// TODO #derive Serde deserialize
-
 /// All the configuration for a KVFilter
+///
+/// If compiled with the "serde" feature, the config can be serialized and deserialized using Serde.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct KVFilterConfig {
     /// The specification of the filtering to be applied to the message. See the `FilterSpec` docs.
@@ -27,10 +33,25 @@ pub struct KVFilterConfig {
     evaluation_order: EvaluationOrder,
 }
 
+// https://serde.rs/remote-derive.html
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Level")]
+pub enum LevelSerdeDef {
+    Critical,
+    Error,
+    Warning,
+    Info,
+    Debug,
+    Trace,
+}
+
 /// Specification of a filter. Filters are either simple filters like "Some Key and value must match this:",
 /// or compound filters like `And`, `Or` that are recursively composed from another filters.
 ///
+/// If compiled with the "serde" feature, the config can be serialized and deserialized using Serde.
+///
 /// See the tests for examples.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum FilterSpec {
     /// Always accept
@@ -42,6 +63,7 @@ pub enum FilterSpec {
     /// Accept when logging level is at least given treshold.
     ///
     /// Example: message with level *Warning* will pass `FilterSpec::LevelAtLeast(Info)`
+    #[serde(with = "LevelSerdeDef")]
     LevelAtLeast(Level),
     /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
     ///
@@ -78,13 +100,6 @@ impl FilterSpec {
     }
 }
 
-/// Simple enum to express a message is to be either Accepted or Rejected
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AcceptOrReject {
-    Accept,
-    Reject,
-}
-
 /// The order of evaluation of message KVs and logger KVs
 ///
 /// The keys and values to be logged come from two sources:
@@ -103,6 +118,7 @@ pub enum AcceptOrReject {
 /// This can have both performance and semantics implications. If you are curious,
 /// see the comment at `KVFilter` for a more thorough discussion.
 ///
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum EvaluationOrder {
     LoggerOnly,
@@ -230,18 +246,18 @@ impl<D> KVFilter<D> {
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -265,8 +281,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-    where
-        D: Drain,
+where
+    D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -288,6 +304,13 @@ impl<D> Drain for KVFilter<D>
 }
 
 // ========== Implementation
+
+/// Simple enum to express a message is to be either Accepted or Rejected
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AcceptOrReject {
+    Accept,
+    Reject,
+}
 
 /// An actual filter in progress that get's progressively simplified during a log message evaluation.
 /// A lightweight clone of FilterSpec.
@@ -863,7 +886,9 @@ mod tests {
             .and(FilterSpec::LevelAtLeast(Level::Debug));
         let subsystem_b = (match_kv("subsystem", "B1").or(match_kv("subsystem", "B2")))
             .and(FilterSpec::LevelAtLeast(Level::Info));
-        let filter = subsystem_a.or(subsystem_b).or(FilterSpec::LevelAtLeast(Level::Warning));
+        let filter = subsystem_a
+            .or(subsystem_b)
+            .or(FilterSpec::LevelAtLeast(Level::Warning));
 
         let tester = Tester::new(filter, EvaluationOrder::LoggerAndMessage);
 
@@ -887,4 +912,3 @@ mod tests {
         tester.assert_accepted(5);
     }
 }
-
