@@ -230,18 +230,18 @@ impl<D> KVFilter<D> {
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -265,8 +265,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-where
-    D: Drain,
+    where
+        D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -843,6 +843,48 @@ mod tests {
         debug!(tester.log, "ACCEPT"; "key1" => "value1a", "key2" => "value2", "neg_key1" => "invalid");
 
         tester.assert_accepted(4);
+    }
+
+    #[test]
+    fn test_complex_example_2() {
+        // This is an example that implements the behavior requested at this issue:
+        // https://github.com/sile/sloggers/issues/9#issuecomment-422685244
+        //
+        // The requested behavior:
+        //
+        // 1. pass all records with ("subsystem": "A1" || "subsystem": "A2") && level at least debug
+        // 2. pass all records with (subsystem": "B1" || "subsystem": "B2") && level at least info
+        // 3. pass all records with level at least warn
+        // 4. reject all other records
+
+        let match_kv = FilterSpec::match_kv;
+
+        let subsystem_a = (match_kv("subsystem", "A1").or(match_kv("subsystem", "A2")))
+            .and(FilterSpec::LevelAtLeast(Level::Debug));
+        let subsystem_b = (match_kv("subsystem", "B1").or(match_kv("subsystem", "B2")))
+            .and(FilterSpec::LevelAtLeast(Level::Info));
+        let filter = subsystem_a.or(subsystem_b).or(FilterSpec::LevelAtLeast(Level::Warning));
+
+        let tester = Tester::new(filter, EvaluationOrder::LoggerAndMessage);
+
+        // Rule 1
+        debug!(tester.log, "ACCEPT"; "subsystem" => "A1");
+        debug!(tester.log, "ACCEPT"; "subsystem" => "A2");
+        debug!(tester.log, "REJECT trace XXX"; "subsystem" => "XXX");
+
+        // Rule 2
+        debug!(tester.log, "REJECT"; "subsystem" => "B1");
+        info!(tester.log, "ACCEPT"; "subsystem" => "B1");
+        info!(tester.log, "ACCEPT"; "subsystem" => "B2");
+        info!(tester.log, "REJECT debug XXX"; "subsystem" => "XXX");
+
+        // Rule 3
+        warn!(tester.log, "ACCEPT: Info level");
+
+        // Rule 4
+        info!(tester.log, "REJECT: Level too low");
+
+        tester.assert_accepted(5);
     }
 }
 
