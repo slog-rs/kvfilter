@@ -36,7 +36,7 @@ pub struct KVFilterConfig {
 // https://serde.rs/remote-derive.html
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Level")]
-pub enum LevelSerdeDef {
+enum LevelSerdeDef {
     Critical,
     Error,
     Warning,
@@ -879,6 +879,8 @@ mod tests {
         // 2. pass all records with (subsystem": "B1" || "subsystem": "B2") && level at least info
         // 3. pass all records with level at least warn
         // 4. reject all other records
+        // In all cases, make decisions based only on the LOGGER keys and values,
+        // don't take the message KVs into account
 
         let match_kv = FilterSpec::match_kv;
 
@@ -890,18 +892,25 @@ mod tests {
             .or(subsystem_b)
             .or(FilterSpec::LevelAtLeast(Level::Warning));
 
-        let tester = Tester::new(filter, EvaluationOrder::LoggerAndMessage);
+        // EvaluationOrder::Logger means that only the logger KVs will be used for message filtering
+        let tester = Tester::new(filter, EvaluationOrder::Logger);
+        let subsystem_a1 = tester.log.new(o!("subsystem" => "A1"));
+        let subsystem_a2 = tester.log.new(o!("subsystem" => "A2"));
+        let subsystem_b1 = tester.log.new(o!("subsystem" => "B1"));
+        let subsystem_b2 = tester.log.new(o!("subsystem" => "B2"));
+        let subsystem_xxx = tester.log.new(o!("subsystem" => "XXX"));
 
         // Rule 1
-        debug!(tester.log, "ACCEPT"; "subsystem" => "A1");
-        debug!(tester.log, "ACCEPT"; "subsystem" => "A2");
-        debug!(tester.log, "REJECT trace XXX"; "subsystem" => "XXX");
+        debug!(subsystem_a1, "ACCEPT");
+        debug!(subsystem_a2, "ACCEPT");
+        debug!(subsystem_xxx, "REJECT debug XXX");
+        debug!(subsystem_xxx, "REJECT debug XXX, message KV is discarded"; "subsystem" => "A1");
 
         // Rule 2
-        debug!(tester.log, "REJECT"; "subsystem" => "B1");
-        info!(tester.log, "ACCEPT"; "subsystem" => "B1");
-        info!(tester.log, "ACCEPT"; "subsystem" => "B2");
-        info!(tester.log, "REJECT debug XXX"; "subsystem" => "XXX");
+        debug!(subsystem_b1, "REJECT");
+        info!(subsystem_b1, "ACCEPT");
+        info!(subsystem_b2, "ACCEPT");
+        info!(subsystem_xxx, "REJECT info XXX");
 
         // Rule 3
         warn!(tester.log, "ACCEPT: Info level");
