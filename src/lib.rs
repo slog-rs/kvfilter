@@ -151,7 +151,7 @@ impl FilterSpec {
 /// see the comment at `KVFilter` for a more thorough discussion.
 ///
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum EvaluationOrder {
     LoggerOnly,
     MessageOnly,
