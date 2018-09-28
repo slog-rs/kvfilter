@@ -28,9 +28,9 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq)]
 pub struct KVFilterConfig {
     /// The specification of the filtering to be applied to the message. See the `FilterSpec` docs.
-    filter_spec: FilterSpec,
+    pub filter_spec: FilterSpec,
     /// See the `EvaluationOrder` docs
-    evaluation_order: EvaluationOrder,
+    pub evaluation_order: EvaluationOrder,
 }
 
 // https://serde.rs/remote-derive.html
