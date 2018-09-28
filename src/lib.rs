@@ -159,6 +159,12 @@ pub enum EvaluationOrder {
     MessageAndLogger,
 }
 
+impl Default for EvaluationOrder {
+    fn default() -> Self {
+        EvaluationOrder::LoggerAndMessage
+    }
+}
+
 /// The KVFilter itself. It implements `Drain`.
 ///
 /// It passes messages matching the criteria specified by a given `config` into an underlying `drain`
