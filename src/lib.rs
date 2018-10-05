@@ -1,7 +1,45 @@
-//! Filter records by matching their keys and values, and allows arbitrary
-//! Bool logic expressions to be used.
+//! Filter records by matching their messages, keys and values. Records can be matched
 //!
-//! See the unit tests (especially `test_complex_example` and `test_complex_example_2`) to see how to use it.
+//!  - based on logging level (debug, info, warn, ...)
+//!  - regular expression on record message
+//!  - keys and values
+//!  - simple records can be arbitrarily composed using `And`, `Or` and `Not` expressions
+//!
+//! # Examples
+//!
+//! This is an example that implements the behavior requested at this [issue](https://github.com/sile/sloggers/issues/9#issuecomment-422685244)
+//!
+//! The requested behavior:
+//!
+//!   1. pass all records with ("subsystem": "A1" || "subsystem": "A2") && level at least debug
+//!   2. pass all records with (subsystem": "B1" || "subsystem": "B2") && level at least info
+//!   3. pass all records with level at least warn
+//!   4. reject all other records
+//!
+//!   In all cases, make decisions based only on the LOGGER keys and values, don't take the message KVs into account
+//! ```
+//! extern crate slog;
+//! extern crate slog_kvfilter;
+//!
+//! use slog_kvfilter::FilterSpec;
+//! use slog::Level;
+//!
+//! let match_kv = FilterSpec::match_kv;
+//!
+//! let subsystem_a = (match_kv("subsystem", "A1").or(match_kv("subsystem", "A2")))
+//!     .and(FilterSpec::LevelAtLeast(Level::Debug));
+//!
+//! let subsystem_b = (match_kv("subsystem", "B1").or(match_kv("subsystem", "B2")))
+//!     .and(FilterSpec::LevelAtLeast(Level::Info));
+//!
+//! // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
+//! // doesn't have to evaluate the more complicated rules if the simpler one already decides a message's fate
+//! let filter = FilterSpec::LevelAtLeast(Level::Warning)
+//!     .or(subsystem_a)
+//!     .or(subsystem_b);
+//!```
+//!
+//! See the unit tests for more example usage.
 //!
 
 #[cfg(feature = "serde")]
@@ -14,9 +52,9 @@ extern crate serde_regex;
 #[macro_use]
 extern crate slog;
 
+extern crate regex;
 #[cfg(not(test))]
 extern crate slog;
-extern crate regex;
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -53,7 +91,6 @@ enum LevelSerdeDef {
     Trace,
 }
 
-
 /// Just a wrapper around Regex to provide
 ///
 ///  - Serde support
@@ -61,10 +98,7 @@ enum LevelSerdeDef {
 ///  - `impl UnwindSafe` - the wrapped Regex is not UnwindSafe, we mark RegexWrapper as being so.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
-pub struct RegexWrapper(
-    #[cfg_attr(feature = "serde", serde(with = "serde_regex"))]
-    Regex
-);
+pub struct RegexWrapper(#[cfg_attr(feature = "serde", serde(with = "serde_regex"))] Regex);
 
 // Just cargo-culting here. I'm not sure what are the actual implications of Regex
 // not being Unwind-safe :-(
@@ -348,24 +382,22 @@ impl<D> KVFilter<D> {
                         AcceptOrReject::Reject
                     }
                 }
-                Filter::MatchMsgRegex(_) => {
-                    AcceptOrReject::Reject
-                }
+                Filter::MatchMsgRegex(_) => AcceptOrReject::Reject,
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -389,8 +421,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-    where
-        D: Drain,
+where
+    D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -535,10 +567,7 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
         }
 
         /// (Partially) in-place evaluate the filter for a particular key and value
-        fn evaluate_filter_with_kv(
-            filter: &mut Filter,
-            context: &mut Context,
-        ) -> slog::Result {
+        fn evaluate_filter_with_kv(filter: &mut Filter, context: &mut Context) -> slog::Result {
             let maybe_simplified_filter = match filter {
                 Filter::Accept => None,
                 Filter::Reject => None,
@@ -562,7 +591,10 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     value: this_value,
                 } => {
                     if &context.key == this_key {
-                        if context.value.is_equal(this_value, context.tmp_value_string)? {
+                        if context
+                            .value
+                            .is_equal(this_value, context.tmp_value_string)?
+                        {
                             Some(Filter::Accept)
                         } else {
                             None
@@ -576,7 +608,9 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     values,
                 } => {
                     if &context.key == this_key {
-                        context.value.remove_from_hash_set(values, context.tmp_value_string)?;
+                        context
+                            .value
+                            .remove_from_hash_set(values, context.tmp_value_string)?;
                         if values.is_empty() {
                             Some(Filter::Accept)
                         } else {
@@ -647,10 +681,7 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
             tmp_value_string: &mut self.tmp_value_string,
         };
 
-        evaluate_filter_with_kv(
-            &mut self.filter,
-            &mut context,
-        )?;
+        evaluate_filter_with_kv(&mut self.filter, &mut context)?;
 
         Ok(())
     }
