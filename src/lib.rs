@@ -3,7 +3,7 @@
 //!  - based on logging level (debug, info, warn, ...)
 //!  - regular expression on record message
 //!  - keys and values
-//!  - simple records can be arbitrarily composed using `And`, `Or` and `Not` expressions
+//!  - simple filters can be arbitrarily composed using `And`, `Or` and `Not` expressions
 //!
 //! # Examples
 //!
