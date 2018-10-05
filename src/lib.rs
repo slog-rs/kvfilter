@@ -17,6 +17,7 @@ extern crate slog;
 
 use slog::{Drain, Key, Level, OwnedKVList, Record, Serializer, KV};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::fmt;
 
 // ========== public KVFilter configuration
@@ -58,13 +59,22 @@ pub enum FilterSpec {
     Accept,
     /// Always reject
     Reject,
-    /// Accept when the key and value match the specification
-    MatchKV { key: String, value: String },
     /// Accept when logging level is at least given treshold.
     ///
     /// Example: message with level *Warning* will pass `FilterSpec::LevelAtLeast(Info)`
     #[serde(with = "LevelSerdeDef")]
     LevelAtLeast(Level),
+    /// Accept when the key and value match the specification
+    MatchKV { key: String, value: String },
+    /// Accept when all `values` for a given `key` are present.
+    ///
+    /// Equivalent to `MatchKV {key, value1}.and(MatchKV {key, value2}).and(...)`,
+    /// but is implemented using a `HashSet` instead of a linked `And` structure, so
+    /// it will be more performant for a larger number of values
+    /// (no benchmarks done, but my guess is > 3 values).
+    ///
+    /// Always accepts on empty `values`
+    MatchAllValues { key: String, values: Vec<String> },
     /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
     ///
     /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
@@ -87,6 +97,13 @@ impl FilterSpec {
         }
     }
 
+    pub fn match_all_values(key: impl ToString, values: &[impl ToString]) -> FilterSpec {
+        FilterSpec::MatchAllValues {
+            key: key.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
     pub fn and(self, other: FilterSpec) -> FilterSpec {
         FilterSpec::And(Box::new(self), Box::new(other))
     }
@@ -103,7 +120,7 @@ impl FilterSpec {
                     head.clone().or(Self::any_of(tail))
                 }
             }
-            None => FilterSpec::Reject
+            None => FilterSpec::Reject,
         }
     }
 
@@ -119,7 +136,7 @@ impl FilterSpec {
                     head.clone().and(Self::all_of(tail))
                 }
             }
-            None => FilterSpec::Reject
+            None => FilterSpec::Reject,
         }
     }
 
@@ -281,21 +298,28 @@ impl<D> KVFilter<D> {
                     }
                 }
                 Filter::MatchKV { .. } => AcceptOrReject::Reject,
+                Filter::MatchAllValues { values, .. } => {
+                    if values.is_empty() {
+                        AcceptOrReject::Accept
+                    } else {
+                        AcceptOrReject::Reject
+                    }
+                }
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -319,8 +343,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-    where
-        D: Drain,
+where
+    D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -346,8 +370,8 @@ impl<D> Drain for KVFilter<D>
 /// Simple enum to express a message is to be either Accepted or Rejected
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AcceptOrReject {
-    Accept,
     Reject,
+    Accept,
 }
 
 /// An actual filter in progress that get's progressively simplified during a log message evaluation.
@@ -356,7 +380,14 @@ enum AcceptOrReject {
 enum Filter<'a> {
     Accept,
     Reject,
-    MatchKV { key: &'a str, value: &'a str },
+    MatchKV {
+        key: &'a str,
+        value: &'a str,
+    },
+    MatchAllValues {
+        key: &'a str,
+        values: HashSet<&'a str>,
+    },
     LevelAtLeast(Level),
     And(Box<Filter<'a>>, Box<Filter<'a>>),
     Or(Box<Filter<'a>>, Box<Filter<'a>>),
@@ -371,6 +402,10 @@ impl<'a> Filter<'a> {
             FilterSpec::MatchKV { key, value } => Filter::MatchKV {
                 key: &key,
                 value: &value,
+            },
+            FilterSpec::MatchAllValues { key, values } => Filter::MatchAllValues {
+                key: &key,
+                values: values.iter().map(|v| v.as_str()).collect(),
             },
             FilterSpec::LevelAtLeast(level) => Filter::LevelAtLeast(*level),
             FilterSpec::And(a, b) => Filter::And(
@@ -404,6 +439,20 @@ impl<'a> ArgumentsValueMemo<'a> {
             self.is_serialized.set(true);
         }
         Ok(tmp_string == value)
+    }
+
+    fn remove_from_hash_set(
+        &self,
+        set: &mut HashSet<&str>,
+        tmp_string: &mut String,
+    ) -> Result<(), fmt::Error> {
+        if !self.is_serialized.get() {
+            tmp_string.clear();
+            fmt::write(tmp_string, *self.arguments)?;
+            self.is_serialized.set(true);
+        }
+        set.remove(tmp_string.as_str());
+        Ok(())
     }
 }
 
@@ -448,6 +497,21 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                 } => {
                     if &key == this_key {
                         if value.is_equal(this_value, tmp_string)? {
+                            Some(Filter::Accept)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Filter::MatchAllValues {
+                    key: this_key,
+                    values,
+                } => {
+                    if &key == this_key {
+                        value.remove_from_hash_set(values, tmp_string)?;
+                        if values.is_empty() {
                             Some(Filter::Accept)
                         } else {
                             None
@@ -831,6 +895,23 @@ mod tests {
         info!(tester.log, "REJECT"; "key" => "bad_value");
         info!(tester.log, "REJECT"; "bad_key" => "value");
         tester.assert_accepted(1);
+    }
+
+    #[test]
+    fn test_match_all_values() {
+        let tester = Tester::new(
+            FilterSpec::match_all_values("key", &["v1", "v2", "v3"]),
+            EvaluationOrder::LoggerAndMessage,
+        );
+        info!(tester.log, "ACCEPT"; "key" => "v1", "key" => "v2", "key" => "v3");
+        info!(tester.log, "ACCEPT"; "key" => "v3", "key" => "v3", "key" => "v1", "key" => "v2");
+        info!(tester.log, "ACCEPT"; "key" => "v3", "key" => "v5", "key" => "v1", "key" => "v2");
+        info!(tester.log, "ACCEPT"; "key" => "v3",  "key" => "v1", "key" => "v2", "key" => "v5",);
+        info!(tester.log, "REJECT");
+        info!(tester.log, "REJECT"; "key" => "v2", "key" => "v3");
+        info!(tester.log, "REJECT"; "key" => "v1", "key" => "v3");
+        info!(tester.log, "REJECT"; "key" => "v1", "key" => "v5", "key" => "v3");
+        tester.assert_accepted(4);
     }
 
     #[test]
