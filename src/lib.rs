@@ -7,6 +7,8 @@
 #[cfg(feature = "serde")]
 #[macro_use]
 extern crate serde;
+#[cfg(feature = "serde")]
+extern crate serde_regex;
 
 #[cfg(test)]
 #[macro_use]
@@ -14,11 +16,15 @@ extern crate slog;
 
 #[cfg(not(test))]
 extern crate slog;
+extern crate regex;
 
-use slog::{Drain, Key, Level, OwnedKVList, Record, Serializer, KV};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt;
+use std::panic::{RefUnwindSafe, UnwindSafe};
+
+use regex::Regex;
+use slog::{Drain, Key, Level, OwnedKVList, Record, Serializer, KV};
 
 // ========== public KVFilter configuration
 
@@ -45,6 +51,31 @@ enum LevelSerdeDef {
     Info,
     Debug,
     Trace,
+}
+
+
+/// Just a wrapper around Regex to provide
+///
+///  - Serde support
+///  - PartialEq (compares the original Regex strings, not the regular expression semantics)
+///  - `impl UnwindSafe` - the wrapped Regex is not UnwindSafe, we mark RegexWrapper as being so.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
+pub struct RegexWrapper(
+    #[cfg_attr(feature = "serde", serde(with = "serde_regex"))]
+    Regex
+);
+
+// Just cargo-culting here. I'm not sure what are the actual implications of Regex
+// not being Unwind-safe :-(
+impl UnwindSafe for RegexWrapper {}
+
+impl RefUnwindSafe for RegexWrapper {}
+
+impl PartialEq for RegexWrapper {
+    fn eq(&self, other: &RegexWrapper) -> bool {
+        format!("{}", self.0) == format!("{}", other.0)
+    }
 }
 
 /// Specification of a filter. Filters are either simple filters like "Some Key and value must match this:",
@@ -76,6 +107,8 @@ pub enum FilterSpec {
     ///
     /// Always accepts on empty `values`
     MatchAllValues { key: String, values: Vec<String> },
+    /// Accept when the log message matches the given regular expression.
+    MatchMsgRegex(RegexWrapper),
     /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
     ///
     /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
@@ -103,6 +136,14 @@ impl FilterSpec {
             key: key.to_string(),
             values: values.iter().map(|v| v.to_string()).collect(),
         }
+    }
+
+    pub fn match_msg_regex(regex: Regex) -> FilterSpec {
+        FilterSpec::MatchMsgRegex(RegexWrapper(regex))
+    }
+
+    pub fn try_match_msg_regex(regex: &str) -> Result<FilterSpec, regex::Error> {
+        Ok(Self::match_msg_regex(Regex::new(regex)?))
     }
 
     pub fn and(self, other: FilterSpec) -> FilterSpec {
@@ -253,7 +294,8 @@ impl<D> KVFilter<D> {
         let mut evaluating_serializer = EvaluateFilterSerializer {
             filter: Filter::from_spec(&self.config.filter_spec),
             message_level: record.level(),
-            tmp_string: String::new(),
+            msg: record.msg(),
+            tmp_value_string: String::new(),
         };
 
         macro_rules! serialize_and_return_if_decided {
@@ -306,21 +348,24 @@ impl<D> KVFilter<D> {
                         AcceptOrReject::Reject
                     }
                 }
+                Filter::MatchMsgRegex(_) => {
+                    AcceptOrReject::Reject
+                }
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -344,8 +389,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-where
-    D: Drain,
+    where
+        D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -381,6 +426,7 @@ enum AcceptOrReject {
 enum Filter<'a> {
     Accept,
     Reject,
+    LevelAtLeast(Level),
     MatchKV {
         key: &'a str,
         value: &'a str,
@@ -389,7 +435,7 @@ enum Filter<'a> {
         key: &'a str,
         values: HashSet<&'a str>,
     },
-    LevelAtLeast(Level),
+    MatchMsgRegex(&'a RegexWrapper),
     And(Box<Filter<'a>>, Box<Filter<'a>>),
     Or(Box<Filter<'a>>, Box<Filter<'a>>),
     Not(Box<Filter<'a>>),
@@ -400,6 +446,7 @@ impl<'a> Filter<'a> {
         match spec {
             FilterSpec::Accept => Filter::Accept,
             FilterSpec::Reject => Filter::Reject,
+            FilterSpec::LevelAtLeast(level) => Filter::LevelAtLeast(*level),
             FilterSpec::MatchKV { key, value } => Filter::MatchKV {
                 key: &key,
                 value: &value,
@@ -408,7 +455,7 @@ impl<'a> Filter<'a> {
                 key: &key,
                 values: values.iter().map(|v| v.as_str()).collect(),
             },
-            FilterSpec::LevelAtLeast(level) => Filter::LevelAtLeast(*level),
+            FilterSpec::MatchMsgRegex(regex_wrapper) => Filter::MatchMsgRegex(&regex_wrapper),
             FilterSpec::And(a, b) => Filter::And(
                 Box::new(Filter::from_spec(&a)),
                 Box::new(Filter::from_spec(&b)),
@@ -433,6 +480,13 @@ struct ArgumentsValueMemo<'a> {
 }
 
 impl<'a> ArgumentsValueMemo<'a> {
+    fn new(arguments: &'a fmt::Arguments) -> ArgumentsValueMemo<'a> {
+        ArgumentsValueMemo {
+            arguments,
+            is_serialized: Cell::new(false),
+        }
+    }
+
     fn is_equal(&self, value: &str, tmp_string: &mut String) -> Result<bool, fmt::Error> {
         if !self.is_serialized.get() {
             tmp_string.clear();
@@ -459,34 +513,45 @@ impl<'a> ArgumentsValueMemo<'a> {
 
 /// This is the filtering workhorse. It used to process a single log message.
 /// It is set up with the logging level of the log message and a filter.
-/// `tmp_str` is there just to avoid repeated string allocation and serves as
+/// `tmp_value_string` is there just to avoid repeated string allocation and serves as
 /// a temporary serialized string for `ArgumentsValueMemo`
 struct EvaluateFilterSerializer<'a> {
     message_level: Level,
+    msg: &'a fmt::Arguments<'a>,
     filter: Filter<'a>,
-    tmp_string: String,
+    tmp_value_string: String,
 }
 
 impl<'a> Serializer for EvaluateFilterSerializer<'a> {
     fn emit_arguments(&mut self, key: Key, value: &fmt::Arguments) -> slog::Result {
-        let mut value = ArgumentsValueMemo {
-            arguments: value,
-            is_serialized: Cell::new(false),
-        };
+        let mut value = ArgumentsValueMemo::new(value);
+
+        struct Context<'a> {
+            level: Level,
+            msg: &'a fmt::Arguments<'a>,
+            key: Key,
+            value: &'a mut ArgumentsValueMemo<'a>,
+            tmp_value_string: &'a mut String,
+        }
 
         /// (Partially) in-place evaluate the filter for a particular key and value
         fn evaluate_filter_with_kv(
             filter: &mut Filter,
-            level: Level,
-            key: Key,
-            value: &mut ArgumentsValueMemo,
-            tmp_string: &mut String,
+            context: &mut Context,
         ) -> slog::Result {
             let maybe_simplified_filter = match filter {
                 Filter::Accept => None,
                 Filter::Reject => None,
+                Filter::MatchMsgRegex(RegexWrapper(regex)) => {
+                    let message = fmt::format(*context.msg);
+                    if regex.is_match(&message) {
+                        Some(Filter::Accept)
+                    } else {
+                        Some(Filter::Reject)
+                    }
+                }
                 Filter::LevelAtLeast(treshold) => {
-                    if level.is_at_least(*treshold) {
+                    if context.level.is_at_least(*treshold) {
                         Some(Filter::Accept)
                     } else {
                         Some(Filter::Reject)
@@ -496,8 +561,8 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     key: this_key,
                     value: this_value,
                 } => {
-                    if &key == this_key {
-                        if value.is_equal(this_value, tmp_string)? {
+                    if &context.key == this_key {
+                        if context.value.is_equal(this_value, context.tmp_value_string)? {
                             Some(Filter::Accept)
                         } else {
                             None
@@ -510,8 +575,8 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     key: this_key,
                     values,
                 } => {
-                    if &key == this_key {
-                        value.remove_from_hash_set(values, tmp_string)?;
+                    if &context.key == this_key {
+                        context.value.remove_from_hash_set(values, context.tmp_value_string)?;
                         if values.is_empty() {
                             Some(Filter::Accept)
                         } else {
@@ -522,11 +587,11 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     }
                 }
                 Filter::And(a, b) => {
-                    evaluate_filter_with_kv(a, level, key, value, tmp_string)?;
+                    evaluate_filter_with_kv(a, context)?;
                     if **a == Filter::Reject {
                         Some(Filter::Reject)
                     } else {
-                        evaluate_filter_with_kv(b, level, key, value, tmp_string)?;
+                        evaluate_filter_with_kv(b, context)?;
                         if **a == Filter::Accept {
                             if **b == Filter::Accept {
                                 Some(Filter::Accept)
@@ -541,11 +606,11 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     }
                 }
                 Filter::Or(a, b) => {
-                    evaluate_filter_with_kv(a, level, key, value, tmp_string)?;
+                    evaluate_filter_with_kv(a, context)?;
                     if **a == Filter::Accept {
                         Some(Filter::Accept)
                     } else {
-                        evaluate_filter_with_kv(b, level, key, value, tmp_string)?;
+                        evaluate_filter_with_kv(b, context)?;
                         if **b == Filter::Accept {
                             Some(Filter::Accept)
                         } else if **a == Filter::Reject && **b == Filter::Reject {
@@ -556,7 +621,7 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     }
                 }
                 Filter::Not(f) => {
-                    evaluate_filter_with_kv(f, level, key, value, tmp_string)?;
+                    evaluate_filter_with_kv(f, context)?;
                     if **f == Filter::Accept {
                         Some(Filter::Reject)
                     } else if **f == Filter::Reject {
@@ -574,12 +639,17 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
             Ok(())
         }
 
+        let mut context = Context {
+            level: self.message_level,
+            msg: self.msg,
+            key,
+            value: &mut value,
+            tmp_value_string: &mut self.tmp_value_string,
+        };
+
         evaluate_filter_with_kv(
             &mut self.filter,
-            self.message_level,
-            key,
-            &mut value,
-            &mut self.tmp_string,
+            &mut context,
         )?;
 
         Ok(())
@@ -913,6 +983,20 @@ mod tests {
         info!(tester.log, "REJECT"; "key" => "v1", "key" => "v3");
         info!(tester.log, "REJECT"; "key" => "v1", "key" => "v5", "key" => "v3");
         tester.assert_accepted(4);
+    }
+
+    #[test]
+    fn test_match_msg_regex() {
+        let tester = Tester::new(
+            FilterSpec::try_match_msg_regex(r"Foo.*Bar").unwrap(),
+            EvaluationOrder::LoggerAndMessage,
+        );
+        info!(tester.log, "ACCEPT FooBar");
+        info!(tester.log, "ACCEPT FooBarFooBar");
+        info!(tester.log, "ACCEPT FooQuxBar");
+        info!(tester.log, "REJECT Foo");
+        info!(tester.log, "REJECT");
+        tester.assert_accepted(3);
     }
 
     #[test]

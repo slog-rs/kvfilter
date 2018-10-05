@@ -11,9 +11,12 @@ repository = "https://github.com/slog-rs/kvfilter"
 readme = "README.md"
 
 [features]
-default=["serde"]
+# serde_regex should be enabled iff serde is enabled.
+# I don't know how to express this in Cargo.toml automatically, though.
+default=["serde", "serde_regex"]
 
 [dependencies]
 serde = { version = "1", optional = true, features = ["derive"] }
+serde_regex = { version = "0", optional = true }
 slog = "2"
 regex = "1"
