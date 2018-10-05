@@ -35,8 +35,9 @@ pub struct KVFilterConfig {
 }
 
 // https://serde.rs/remote-derive.html
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "Level")]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(remote = "Level"))]
+#[allow(dead_code)]
 enum LevelSerdeDef {
     Critical,
     Error,
@@ -62,7 +63,7 @@ pub enum FilterSpec {
     /// Accept when logging level is at least given treshold.
     ///
     /// Example: message with level *Warning* will pass `FilterSpec::LevelAtLeast(Info)`
-    #[serde(with = "LevelSerdeDef")]
+    #[cfg_attr(feature = "serde", serde(with = "LevelSerdeDef"))]
     LevelAtLeast(Level),
     /// Accept when the key and value match the specification
     MatchKV { key: String, value: String },
