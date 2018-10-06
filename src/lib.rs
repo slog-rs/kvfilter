@@ -16,13 +16,14 @@
 //!   3. pass all records with level at least warn
 //!   4. reject all other records
 //!
-//!   In all cases, make decisions based only on the LOGGER keys and values, don't take the message KVs into account
+//! In all cases, make decisions based only on the LOGGER keys and values,
+//! don't take the message KVs into account (`EvaluationOrder::LoggerOnly`)
 //! ```
 //! extern crate slog;
 //! extern crate slog_kvfilter;
 //!
-//! use slog_kvfilter::FilterSpec;
-//! use slog::Level;
+//! use slog_kvfilter::{EvaluationOrder, FilterSpec, KVFilter};
+//! use slog::{Discard, Level};
 //!
 //! let match_kv = FilterSpec::match_kv;
 //!
@@ -34,9 +35,12 @@
 //!
 //! // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
 //! // doesn't have to evaluate the more complicated rules if the simpler one already decides a message's fate
-//! let filter = FilterSpec::LevelAtLeast(Level::Warning)
+//! let filter_spec = FilterSpec::LevelAtLeast(Level::Warning)
 //!     .or(subsystem_a)
 //!     .or(subsystem_b);
+//! let root_drain = Discard;
+//! let kv_filter = KVFilter::new(root_drain, filter_spec, EvaluationOrder::LoggerOnly);
+//! // Use the kv_filter as your `Drain`
 //!```
 //!
 //! See the unit tests for more example usage.
