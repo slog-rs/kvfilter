@@ -1,7 +1,7 @@
 [package]
 name = "slog-kvfilter"
-version = "0.6.1"
-authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>", "Tony Przygienda <prz@zeta2.ch>"]
+version = "0.7.0"
+authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>", "Tony Przygienda <prz@zeta2.ch>", "Tomáš Dvořák <https://github.com/dvtomas>"]
 description = "Key values and Regex based filter Drain for slog-rs"
 keywords = ["slog", "logging", "log", "filter"]
 license = "MPL-2.0/MIT/Apache-2.0"
@@ -10,7 +10,26 @@ homepage = "https://github.com/slog-rs/slog"
 repository = "https://github.com/slog-rs/kvfilter"
 readme = "README.md"
 
+[features]
+# serde_regex should be enabled iff serde is enabled.
+# I don't know how to express this in Cargo.toml automatically, though.
+default=["serde", "serde_regex"]
 
 [dependencies]
-slog = "2"
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_regex = { version = "0", optional = true }
 regex = "1"
+
+
+[dependencies.slog]
+version = "2"
+default-features = false
+# So that the tests can reliably use debug and trace macros
+features = ["max_level_trace", "release_max_level_trace", "std"]
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "kvfilter_benchmark"
+harness = false
