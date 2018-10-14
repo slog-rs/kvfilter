@@ -26,3 +26,10 @@ version = "2"
 default-features = false
 # So that the tests can reliably use debug and trace macros
 features = ["max_level_trace", "release_max_level_trace", "std"]
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "kvfilter_benchmark"
+harness = false
