@@ -138,13 +138,13 @@ pub enum FilterSpec {
     MatchKV { key: String, value: String },
     /// Accept when all `values` for a given `key` are present.
     ///
-    /// Equivalent to `MatchKV {key, value1}.and(MatchKV {key, value2}).and(...)`,
-    /// but is implemented using a `HashSet` instead of a linked `And` structure, so
+    /// Equivalent to `MatchKV {key, value1}.or(MatchKV {key, value2}).or(...)`,
+    /// but is implemented using a `HashSet` instead of a linked `Or` structure, so
     /// it will be more performant for a larger number of values
     /// (no benchmarks done, but my guess is > 3 values).
     ///
     /// Always accepts on empty `values`
-    MatchAllValues { key: String, values: Vec<String> },
+    MatchAnyValue { key: String, values: Vec<String> },
     /// Accept when the log message matches the given regular expression.
     MatchMsgRegex(RegexWrapper),
     /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
@@ -169,8 +169,8 @@ impl FilterSpec {
         }
     }
 
-    pub fn match_all_values(key: impl ToString, values: &[impl ToString]) -> FilterSpec {
-        FilterSpec::MatchAllValues {
+    pub fn match_any_value(key: impl ToString, values: &[impl ToString]) -> FilterSpec {
+        FilterSpec::MatchAnyValue {
             key: key.to_string(),
             values: values.iter().map(|v| v.to_string()).collect(),
         }
@@ -379,7 +379,7 @@ impl<D> KVFilter<D> {
                     }
                 }
                 Filter::MatchKV { .. } => AcceptOrReject::Reject,
-                Filter::MatchAllValues { values, .. } => {
+                Filter::MatchAnyValue { values, .. } => {
                     if values.is_empty() {
                         AcceptOrReject::Accept
                     } else {
@@ -390,18 +390,18 @@ impl<D> KVFilter<D> {
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                    {
-                        AcceptOrReject::Accept
-                    } else {
+                        {
+                            AcceptOrReject::Accept
+                        } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -425,8 +425,8 @@ impl<D> KVFilter<D> {
 }
 
 impl<D> Drain for KVFilter<D>
-where
-    D: Drain,
+    where
+        D: Drain,
 {
     type Ok = Option<D::Ok>;
     type Err = Option<D::Err>;
@@ -467,7 +467,7 @@ enum Filter<'a> {
         key: &'a str,
         value: &'a str,
     },
-    MatchAllValues {
+    MatchAnyValue {
         key: &'a str,
         values: HashSet<&'a str>,
     },
@@ -487,7 +487,7 @@ impl<'a> Filter<'a> {
                 key: &key,
                 value: &value,
             },
-            FilterSpec::MatchAllValues { key, values } => Filter::MatchAllValues {
+            FilterSpec::MatchAnyValue { key, values } => Filter::MatchAnyValue {
                 key: &key,
                 values: values.iter().map(|v| v.as_str()).collect(),
             },
@@ -532,18 +532,13 @@ impl<'a> ArgumentsValueMemo<'a> {
         Ok(tmp_string == value)
     }
 
-    fn remove_from_hash_set(
-        &self,
-        set: &mut HashSet<&str>,
-        tmp_string: &mut String,
-    ) -> Result<(), fmt::Error> {
+    fn is_contained_in_hash_set(&self, set: &HashSet<&str>, tmp_string: &mut String) -> Result<bool, fmt::Error> {
         if !self.is_serialized.get() {
             tmp_string.clear();
             fmt::write(tmp_string, *self.arguments)?;
             self.is_serialized.set(true);
         }
-        set.remove(tmp_string.as_str());
-        Ok(())
+        Ok(set.contains(tmp_string.as_str()))
     }
 }
 
@@ -598,28 +593,23 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                         if context
                             .value
                             .is_equal(this_value, context.tmp_value_string)?
-                        {
-                            Some(Filter::Accept)
-                        } else {
+                            {
+                                Some(Filter::Accept)
+                            } else {
                             None
                         }
                     } else {
                         None
                     }
                 }
-                Filter::MatchAllValues {
+                Filter::MatchAnyValue {
                     key: this_key,
                     values,
                 } => {
-                    if &context.key == this_key {
-                        context
-                            .value
-                            .remove_from_hash_set(values, context.tmp_value_string)?;
-                        if values.is_empty() {
-                            Some(Filter::Accept)
-                        } else {
-                            None
-                        }
+                    if &context.key == this_key &&
+                        context.value
+                            .is_contained_in_hash_set(values, context.tmp_value_string)? {
+                        Some(Filter::Accept)
                     } else {
                         None
                     }
@@ -1004,19 +994,18 @@ mod tests {
     }
 
     #[test]
-    fn test_match_all_values() {
+    fn test_match_any_value() {
         let tester = Tester::new(
-            FilterSpec::match_all_values("key", &["v1", "v2", "v3"]),
+            FilterSpec::match_any_value("key", &["v1", "v2", "v3"]),
             EvaluationOrder::LoggerAndMessage,
         );
-        info!(tester.log, "ACCEPT"; "key" => "v1", "key" => "v2", "key" => "v3");
-        info!(tester.log, "ACCEPT"; "key" => "v3", "key" => "v3", "key" => "v1", "key" => "v2");
-        info!(tester.log, "ACCEPT"; "key" => "v3", "key" => "v5", "key" => "v1", "key" => "v2");
+        info!(tester.log, "ACCEPT"; "key" => "v1");
+        info!(tester.log, "ACCEPT"; "key" => "v3");
+        info!(tester.log, "ACCEPT"; "key" => "foo", "key" => "v2", "key" => "bar");
         info!(tester.log, "ACCEPT"; "key" => "v3",  "key" => "v1", "key" => "v2", "key" => "v5",);
         info!(tester.log, "REJECT");
-        info!(tester.log, "REJECT"; "key" => "v2", "key" => "v3");
-        info!(tester.log, "REJECT"; "key" => "v1", "key" => "v3");
-        info!(tester.log, "REJECT"; "key" => "v1", "key" => "v5", "key" => "v3");
+        info!(tester.log, "REJECT"; "key" => "foo", "key" => "bar");
+        info!(tester.log, "REJECT"; "bad_key" => "v1");
         tester.assert_accepted(4);
     }
 
@@ -1090,16 +1079,17 @@ mod tests {
         //   level: Debug (that actually means level at least Info)
         // }
 
-        let match_kv = FilterSpec::match_kv;
-
         // (key1 must be either value1a or value1b) AND key2 must be value2
-        let positive_filter = (match_kv("key1", "value1a").or(match_kv("key1", "value1b")))
-            .and(match_kv("key2", "value2"));
+        let positive_filter = FilterSpec::all_of(&[
+            FilterSpec::match_any_value("key1", &["value1a", "value1b"]),
+            FilterSpec::match_kv("key2", "value2")
+        ]);
 
         // neg_key1 must be neg_value1 OR neg_key2 must be neg_value2a OR neg_key2 must be neg_value2b
-        let negative_filter = match_kv("neg_key1", "neg_value1")
-            .or(match_kv("neg_key2", "neg_value2a"))
-            .or(match_kv("neg_key2", "neg_value2b"));
+        let negative_filter = FilterSpec::any_of(&[
+            FilterSpec::match_kv("neg_key1", "neg_value1"),
+            FilterSpec::match_any_value("neg_key2", &["neg_value2a", "neg_value2b"]),
+        ]);
 
         // We pass everything with level at least info, OR anything that matches the positive filter but not the negative one.
         // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
