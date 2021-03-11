@@ -161,7 +161,7 @@ impl<'a, D: slog::Drain> KVFilter<D> {
         self
     }
 
-    pub fn only_pass_on_all_keys_absence<'b, I: Iterator<Item = &'b String>>(mut self, keys: I) -> Self {
+    pub fn only_pass_on_all_keys_absent<'b, I: Iterator<Item = &'b String>>(mut self, keys: I) -> Self {
         if let Some(ref mut v) = self.keypresence {
             v.extend(keys.map(|v| (v.clone(), false)));
         }
@@ -196,7 +196,7 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     }
 
     fn is_match(&self, record: &slog::Record, logger_values: &slog::OwnedKVList) -> bool {
-        // println!("------------");
+         // println!("------------");
 
         // Can't use chaining here, as it's not possible to cast
         // SyncSerialize to Serialize
@@ -243,7 +243,8 @@ impl<'a, D: slog::Drain> KVFilter<D> {
 
         // println!("{} after checking for positive key hits {:?}", pass, &negser.presence);
 
-        pass &= self.keypresence.as_ref().map_or(true, |kp|
+        pass &= self.keypresence.as_ref()
+            .map_or(true, |kp|
             negser.presence.iter().filter(|(_, v)| !**v).count() == kp.iter().filter(|(_, v)| !**v).count());
 
         // println!("{} after checking for negative key hits {:?}", pass, &negser.presence);
@@ -305,9 +306,10 @@ mod tests {
     use super::KVFilter;
     use slog::{Drain, Level, Logger, OwnedKVList, Record};
     use regex::Regex;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
     use std::iter::FromIterator;
     use std::sync::Mutex;
+    use std::fmt::Debug;
     use std::fmt::Display;
     use std::fmt::Formatter;
     use std::fmt::Result as FmtResult;
@@ -526,29 +528,66 @@ mod tests {
             output: out.clone(),
         };
 
-        const POS1 : &str = "p1";
-        const POS2 : &str = "p2";
-        const NEG1 : &str = "n1";
-        const NEG2 : &str = "n2";
+        const POS1: &str = "p1";
+        const POS2: &str = "p2";
+        const NEG1: &str = "n1";
+        const NEG2: &str = "n2";
 
         let tostriter = |slice: &[&str]|
             slice.iter().map(|v| v.to_string())
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
         // build some small filter
         let filter = KVFilter::new(drain.fuse(), Level::Info)
             .only_pass_on_any_key_present(tostriter(&[POS1, POS2]).iter())
-            .only_pass_on_all_keys_absence(tostriter(&[NEG1, NEG2]).iter());
+            .only_pass_on_all_keys_absent(tostriter(&[NEG1, NEG2]).iter());
 
         let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
 
         info!(mainlog, "NO: none of positive but negative"; NEG1 => "" );
-        info!(mainlog, "NO: positive but negative also present"; "p1" => "", "n1" => "" );
-        info!(mainlog, "YES: positive"; "p1" => "", );
+        info!(mainlog, "NO: positive but negative also present"; POS1 => "", NEG1 => "" );
+        info!(mainlog, "YES: positive"; POS1 => "", );
 
         println!("resulting output: {:#?}", *out.lock().unwrap());
 
         assert_eq!(out.lock().unwrap().len(), 1);
+    }
 
+    #[test]
+    fn should_not_log_info_messages() {
+        let out = Arc::new(Mutex::new(vec![]));
+
+        let drain = StringDrain {
+            output: out.clone(),
+        };
+
+        let filter =  KVFilter::new(drain.fuse(), Level::Info)
+            .only_pass_on_any_key_present(["err".to_string()].iter())
+            .always_suppress_any(Some(
+                HashMap::from_iter(
+                    vec![(
+                        "err".to_string(),
+                        HashSet::from_iter(vec!["None".to_string(), "".to_string()]),
+                    )]
+                )
+            ));
+
+        let logger = Logger::root(filter.fuse(), o!());
+
+        // should discard
+        info!(logger, "NO: test info");
+        info!(logger, "NO: test info"; "count" => 10);
+        info!(logger, "NO: test error"; "err" => "None");
+        info!(logger, "NO: test error"; "err" => "");
+        info!(logger, "NO: test info"; "count" => 10);
+        debug!(logger, "NO: test debug");
+
+        // should log to drain
+        info!(logger, "YES: test error"; "err" => "Panic!");
+        error!(logger, "YES: test error");
+
+        println!("resulting output: {:#?}", *out.lock().unwrap());
+
+        assert_eq!(out.lock().unwrap().len(), 2);
     }
 }
