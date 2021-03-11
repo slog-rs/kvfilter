@@ -22,10 +22,10 @@ regex = "1"
 
 
 [dependencies.slog]
-version = "2"
+version = "2.7"
 default-features = false
 # So that the tests can reliably use debug and trace macros
-features = ["max_level_trace", "release_max_level_trace", "std"]
+features = ["max_level_trace", "release_max_level_trace", "std", "dynamic-keys"]
 
 [dev-dependencies]
 criterion = "0.2"

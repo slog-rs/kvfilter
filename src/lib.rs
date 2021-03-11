@@ -46,30 +46,30 @@
 //! See the unit tests for more example usage.
 //!
 
+extern crate regex;
 #[cfg(feature = "serde")]
 #[macro_use]
 extern crate serde;
 #[cfg(feature = "serde")]
 extern crate serde_regex;
-
 #[cfg(test)]
 #[macro_use]
 extern crate slog;
-
-extern crate regex;
 #[cfg(not(test))]
 extern crate slog;
 
-use std::cell::Cell;
-use std::collections::HashSet;
-use std::fmt;
-use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::{
+    cell::Cell,
+    collections::HashSet,
+    fmt,
+    panic::{RefUnwindSafe, UnwindSafe},
+};
 
 use regex::Regex;
-use slog::{Drain, Key, Level, OwnedKVList, Record, Serializer, KV};
 
-// ========== public KVFilter configuration
+use slog::{Drain, Key, KV, Level, OwnedKVList, Record, Serializer};
 
+//region KVFilterConfig
 /// All the configuration for a KVFilter
 ///
 /// If compiled with the "serde" feature, the config can be serialized and deserialized using Serde.
@@ -147,6 +147,8 @@ pub enum FilterSpec {
     MatchAnyValue { key: String, values: Vec<String> },
     /// Accept when the log message matches the given regular expression.
     MatchMsgRegex(RegexWrapper),
+    /// Accepts when the key is present
+    KeyExists(String),
     /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
     ///
     /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
@@ -182,6 +184,10 @@ impl FilterSpec {
 
     pub fn try_match_msg_regex(regex: &str) -> Result<FilterSpec, regex::Error> {
         Ok(Self::match_msg_regex(Regex::new(regex)?))
+    }
+
+    pub fn key_exists(key: impl ToString) -> FilterSpec {
+        FilterSpec::KeyExists(key.to_string())
     }
 
     pub fn and(self, other: FilterSpec) -> FilterSpec {
@@ -261,7 +267,9 @@ impl Default for EvaluationOrder {
         EvaluationOrder::LoggerAndMessage
     }
 }
+//endregion
 
+//region KVFilter
 /// The KVFilter itself. It implements `Drain`.
 ///
 /// It passes messages matching the criteria specified by a given `config` into an underlying `drain`
@@ -387,21 +395,22 @@ impl<D> KVFilter<D> {
                     }
                 }
                 Filter::MatchMsgRegex(_) => AcceptOrReject::Reject,
+                Filter::KeyExists(_) => AcceptOrReject::Reject,
                 Filter::And(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
                 Filter::Or(a, b) => {
                     if final_evaluate_filter(a, level) == AcceptOrReject::Accept
                         || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
+                    {
+                        AcceptOrReject::Accept
+                    } else {
                         AcceptOrReject::Reject
                     }
                 }
@@ -446,9 +455,9 @@ impl<D> Drain for KVFilter<D>
         }
     }
 }
+//endregion
 
-// ========== Implementation
-
+//region Filtering implementation
 /// Simple enum to express a message is to be either Accepted or Rejected
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AcceptOrReject {
@@ -467,6 +476,7 @@ enum Filter<'a> {
         key: &'a str,
         value: &'a str,
     },
+    KeyExists(&'a str),
     MatchAnyValue {
         key: &'a str,
         values: HashSet<&'a str>,
@@ -492,6 +502,7 @@ impl<'a> Filter<'a> {
                 values: values.iter().map(|v| v.as_str()).collect(),
             },
             FilterSpec::MatchMsgRegex(regex_wrapper) => Filter::MatchMsgRegex(&regex_wrapper),
+            FilterSpec::KeyExists(key) => Filter::KeyExists(&key),
             FilterSpec::And(a, b) => Filter::And(
                 Box::new(Filter::from_spec(&a)),
                 Box::new(Filter::from_spec(&b)),
@@ -590,12 +601,9 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     value: this_value,
                 } => {
                     if &context.key == this_key {
-                        if context
-                            .value
-                            .is_equal(this_value, context.tmp_value_string)?
-                            {
-                                Some(Filter::Accept)
-                            } else {
+                        if context.value.is_equal(this_value, context.tmp_value_string)? {
+                            Some(Filter::Accept)
+                        } else {
                             None
                         }
                     } else {
@@ -609,6 +617,13 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                     if &context.key == this_key &&
                         context.value
                             .is_contained_in_hash_set(values, context.tmp_value_string)? {
+                        Some(Filter::Accept)
+                    } else {
+                        None
+                    }
+                }
+                Filter::KeyExists(this_key) => {
+                    if &context.key == this_key {
                         Some(Filter::Accept)
                     } else {
                         None
@@ -680,18 +695,25 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
         Ok(())
     }
 }
+//endregion
 
+//region tests
 #[cfg(test)]
 mod tests {
-    use super::FilterSpec::*;
-    use super::*;
-
-    use std::fmt;
-    use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fmt,
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
 
     use slog::{Drain, FnValue, Level, Logger, OwnedKVList, Record};
+
+    use super::*;
+    use super::FilterSpec::*;
 
     #[derive(Debug)]
     struct StringDrain {
@@ -1024,6 +1046,21 @@ mod tests {
     }
 
     #[test]
+    fn test_key_exists() {
+        let tester = Tester::new(
+            FilterSpec::key_exists("key"),
+            EvaluationOrder::LoggerAndMessage,
+        );
+        info!(tester.log, "ACCEPT: Good key"; "key" => "value");
+        info!(tester.log, "ACCEPT: Good key"; "foo" => "bar", "key" => "value", "bar" => "baz");
+        info!(tester.log, "REJECT"; "main_log" => "m");
+        info!(tester.log, "REJECT"; "bad_key" => "value");
+        info!(tester.log, "REJECT");
+        tester.assert_accepted(2);
+    }
+
+
+    #[test]
     fn test_and() {
         {
             let tester = Tester::new(
@@ -1170,4 +1207,33 @@ mod tests {
 
         tester.assert_accepted(5);
     }
+
+
+    #[test]
+    fn test_complex_example_3() {
+        // Implements https://github.com/slog-rs/kvfilter/pull/16#issuecomment-795856834
+
+        let tester = Tester::new(
+            LevelAtLeast(Level::Warning).or(
+                LevelAtLeast(Level::Info).and(
+                    FilterSpec::key_exists("err")
+                        .and(FilterSpec::match_kv("err", "None").not())
+                        .and(FilterSpec::match_kv("err", "").not())
+                )),
+            EvaluationOrder::LoggerAndMessage,
+        );
+
+        // should discard
+        info!(tester.log, "REJECT: test info");
+        info!(tester.log, "REJECT: test info"; "count" => 10);
+        info!(tester.log, "REJECT: test error"; "err" => "None");
+        info!(tester.log, "REJECT: test error"; "err" => "");
+        debug!(tester.log, "REJECT: test debug");
+
+        // should log to drain
+        info!(tester.log, "ACCEPT: test error"; "err" => "Panic!");
+        error!(tester.log, "ACCEPT: test error");
+        tester.assert_accepted(2);
+    }
 }
+//endregion
