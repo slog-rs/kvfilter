@@ -1228,6 +1228,7 @@ mod tests {
         info!(tester.log, "REJECT: test info"; "count" => 10);
         info!(tester.log, "REJECT: test error"; "err" => "None");
         info!(tester.log, "REJECT: test error"; "err" => "");
+        debug!(tester.log, "REJECT: test debug"; "err" => "Panic!");
         debug!(tester.log, "REJECT: test debug");
 
         // should log to drain
