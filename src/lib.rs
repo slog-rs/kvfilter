@@ -1,4 +1,5 @@
-//! Filter records by matching some of their keys against a sets of values while allowing
+//! Filter records by checking for presence/absence of keys first. After this it is
+//! matching some of the keys against a sets of values while allowing
 //! for records of level high enough to pass. It also can apply a negative filter after the
 //! positive filter to allow sophisticated 'hole-punching' into a matching category. Ultimately,
 //! the resulting message (without keys and values) can be constrained by both presence of a regex
@@ -25,17 +26,25 @@ use regex::Regex;
 
 // @todo: must that be thread-safe?
 struct FilteringSerializer<'a> {
-    pending_matches: KVFilterListFlyWeight<'a>,
+    presence: KeyPresenceMapFlyWeight<'a>,
+    valuematches: KVFilterListFlyWeight<'a>,
     tmp_str: String,
 }
 
 impl<'a> slog::Serializer for FilteringSerializer<'a> {
     fn emit_arguments(&mut self, key: slog::Key, val: &fmt::Arguments) -> slog::Result {
-        if self.pending_matches.is_empty() {
+        if self.valuematches.is_empty() && self.presence.is_empty() {
             return Ok(());
         }
 
-        let matched = if let Some(keyvalues) = self.pending_matches.get(&key) {
+        // either filter is empty (always e'thing passes) or filter keys
+        let matched = !self.presence.is_empty();
+
+        if matched {
+            self.presence.remove(&key);
+        }
+
+        let matched = if let Some(keyvalues) = self.valuematches.get(&key) {
             self.tmp_str.clear();
             fmt::write(&mut self.tmp_str, *val)?;
 
@@ -45,12 +54,18 @@ impl<'a> slog::Serializer for FilteringSerializer<'a> {
         };
 
         if matched {
-            self.pending_matches.remove(&key);
+            self.valuematches.remove(&key);
         }
 
         Ok(())
     }
 }
+
+/// tests either for presence or lack of key if in this list
+pub type KeyPresenceMap = HashMap<String, bool>;
+
+/// flyweight copy that is created upfront and given to every serializer
+type KeyPresenceMapFlyWeight<'a> = HashMap<&'a str, bool>;
 
 /// Must be a hashmap since we do not rely on ordered keys
 pub type KVFilterList = HashMap<String, HashSet<String>>;
@@ -82,6 +97,8 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 ///
 /// More precisely
 ///
+///   * if any key presence filter is present it's tested for the presence (or lack)
+///     of key (no value checks) first
 ///   * a key is ignored until present in `filters`, otherwise an entry must
 ///     match for all the keys present in `filters` for any of the values given
 ///     for the key to pass the filter.
@@ -106,6 +123,7 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 /// modules, such as e.g. "sending packet" or "running FSM".
 pub struct KVFilter<D: slog::Drain> {
     drain: D,
+    keypresence: Option<KeyPresenceMap>,
     filters: Option<KVFilterList>,
     neg_filters: Option<KVFilterList>,
     level: slog::Level,
@@ -126,11 +144,28 @@ impl<'a, D: slog::Drain> KVFilter<D> {
         KVFilter {
             drain: drain,
             level: level,
+            keypresence: None,
             filters: None,
             neg_filters: None,
             regex: None,
             neg_regex: None,
         }
+    }
+
+    pub fn only_pass_on_any_key_present<'b, I: Iterator<Item = &'b String>>(mut self, keys: I) -> Self {
+        if let Some(ref mut v) = self.keypresence {
+            v.extend(keys.map(|v| (v.clone(), true)));
+        } else {
+            self.keypresence = Some(keys.map(|v| (v.clone(), true)).collect());
+        }
+        self
+    }
+
+    pub fn only_pass_on_all_keys_absent<'b, I: Iterator<Item = &'b String>>(mut self, keys: I) -> Self {
+        if let Some(ref mut v) = self.keypresence {
+            v.extend(keys.map(|v| (v.clone(), false)));
+        }
+        self
     }
 
     /// pass through entries with all keys with _any_ of the matching values in its entries
@@ -161,46 +196,73 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     }
 
     fn is_match(&self, record: &slog::Record, logger_values: &slog::OwnedKVList) -> bool {
+         // println!("------------");
+
         // Can't use chaining here, as it's not possible to cast
         // SyncSerialize to Serialize
-        let mut ser = FilteringSerializer {
-            pending_matches: self.filters.as_ref().map_or(HashMap::new(), |f| {
+        let mut pres = FilteringSerializer {
+            presence: Default::default(),
+            valuematches: self.filters.as_ref().map_or(HashMap::new(), |f| {
                 f.iter().map(|(k, v)| (k.as_str(), v)).collect()
             }),
             tmp_str: String::new(),
         };
+
+        // println!("{:?}", self.keypresence);
 
         let mut negser = FilteringSerializer {
-            pending_matches: self.neg_filters.as_ref().map_or(HashMap::new(), |ref f| {
+            presence: self.keypresence.as_ref().map_or(HashMap::new(), |f| {
+                f.iter().map(|(k, v)| (k.as_str(), *v)).collect()
+            }),
+            valuematches: self.neg_filters.as_ref().map_or(HashMap::new(), |ref f| {
                 f.iter().map(|(k, v)| (k.as_str(), v)).collect()
             }),
             tmp_str: String::new(),
         };
 
-        record.kv().serialize(record, &mut ser).unwrap();
+        record.kv().serialize(record, &mut pres).unwrap();
 
         // negative we have to go all way down to check for _any_ key match
         record.kv().serialize(record, &mut negser).unwrap();
         logger_values.serialize(record, &mut negser).unwrap();
 
-        let anynegativematch = ||
-            negser.pending_matches.len() == self.neg_filters.as_ref()
+        let anypositivematch = |pres: &FilteringSerializer|
+            pres.valuematches.is_empty();
+
+        let anynegativematch = |negser: &FilteringSerializer|
+            negser.valuematches.len() == self.neg_filters.as_ref()
                 .map_or(0,
                         |m| m.keys().len());
 
-        let mut pass = if ser.pending_matches.is_empty() {
-            // if e'thing matched on the positive make sure _nothing_ matched on negative
-            anynegativematch()
-        } else {
-            // check inside whether we find more matches
-            logger_values.serialize(record, &mut ser).unwrap();
+        // at least one positive gone & all negatives remain (i.e. no negatives found)
+        let mut pass =
+            self.keypresence.as_ref().map_or(true, |kp| {
+                let pos = negser.presence.iter().filter(|(_, v)| **v).count();
+                pos == 0 || pos < kp.iter().filter(|(_, v)| **v).count()
+            });
 
-            if ser.pending_matches.is_empty() {
-                anynegativematch()
+        // println!("{} after checking for positive key hits {:?}", pass, &negser.presence);
+
+        pass &= self.keypresence.as_ref()
+            .map_or(true, |kp|
+            negser.presence.iter().filter(|(_, v)| !**v).count() == kp.iter().filter(|(_, v)| !**v).count());
+
+        // println!("{} after checking for negative key hits {:?}", pass, &negser.presence);
+
+        pass &=
+            if anypositivematch(&pres) {
+                // if e'thing matched on the positive make sure _nothing_ matched on negative
+                anynegativematch(&negser)
             } else {
-                false
-            }
-        };
+                // check inside whether we find more matches
+                logger_values.serialize(record, &mut pres).unwrap();
+
+                if anypositivematch(&pres) {
+                    anynegativematch(&negser)
+                } else {
+                    false
+                }
+            };
 
         if pass && (self.regex.is_some() || self.neg_regex.is_some()) {
             let res = format(*record.msg());
@@ -244,9 +306,10 @@ mod tests {
     use super::KVFilter;
     use slog::{Drain, Level, Logger, OwnedKVList, Record};
     use regex::Regex;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
     use std::iter::FromIterator;
     use std::sync::Mutex;
+    use std::fmt::Debug;
     use std::fmt::Display;
     use std::fmt::Formatter;
     use std::fmt::Result as FmtResult;
@@ -272,7 +335,7 @@ mod tests {
             let fmt = format!("{:?}", info.msg());
 
             if !fmt.contains(YES) && !fmt.contains(NO) {
-                panic!(fmt);
+                panic!("{}", fmt);
             }
 
             (*lo).push(fmt);
@@ -410,11 +473,11 @@ mod tests {
         info!(mainlog, "NO: filtered, main, no keys");
         info!(mainlog, "YES: unfiltered, on of thread matches, direction matches";
         "thread" => "100", "direction" => "send");
-        info!(subsubsublog, "YES: unfiltered, on of thread matches, direction matches, deep doesn't apply";
+        info!(subsubsublog, "YES: unfiltered, one of thread matches, direction matches, deep doesn't apply";
         "thread" => "100", "direction" => "send");
-        info!(negsubsubsublog, "NO: filtered, on of thread matches, direction matches, deep negative applies";
+        info!(negsubsubsublog, "NO: filtered, one of thread matches, direction matches, deep negative applies";
         "thread" => "100", "direction" => "send");
-        info!(subsubsublog, "NO: filtered, on of thread matches, direction matches, deep doesn't apply but deeper does";
+        info!(subsubsublog, "NO: filtered, one of thread matches, direction matches, deep doesn't apply but deeper does";
         "thread" => "100", "direction" => "send", "deepercomp" => "4");
         info!(subsubsublog, "YES: unfiltered, on of thread matches, direction matches, deep doesn't apply and deeper doesn't";
         "thread" => "100", "direction" => "send", "deepercomp" => "7");
@@ -448,6 +511,80 @@ mod tests {
         info!(mainlog, "NO: filtered, no positive");
         info!(mainlog, "YES: PASS2: not filtered, positive");
         info!(mainlog, "YES: {}: not filtered, positive", "PASS4");
+
+        println!("resulting output: {:#?}", *out.lock().unwrap());
+
+        assert_eq!(out.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    /// test presence key negative and positive
+    fn keypresence() {
+        assert!(Level::Critical < Level::Warning);
+
+        let out = Arc::new(Mutex::new(vec![]));
+
+        let drain = StringDrain {
+            output: out.clone(),
+        };
+
+        const POS1: &str = "p1";
+        const POS2: &str = "p2";
+        const NEG1: &str = "n1";
+        const NEG2: &str = "n2";
+
+        let tostriter = |slice: &[&str]|
+            slice.iter().map(|v| v.to_string())
+                .collect::<Vec<_>>();
+
+        // build some small filter
+        let filter = KVFilter::new(drain.fuse(), Level::Info)
+            .only_pass_on_any_key_present(tostriter(&[POS1, POS2]).iter())
+            .only_pass_on_all_keys_absent(tostriter(&[NEG1, NEG2]).iter());
+
+        let mainlog = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+
+        info!(mainlog, "NO: none of positive but negative"; NEG1 => "" );
+        info!(mainlog, "NO: positive but negative also present"; POS1 => "", NEG1 => "" );
+        info!(mainlog, "YES: positive"; POS1 => "", );
+
+        println!("resulting output: {:#?}", *out.lock().unwrap());
+
+        assert_eq!(out.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn should_not_log_info_messages() {
+        let out = Arc::new(Mutex::new(vec![]));
+
+        let drain = StringDrain {
+            output: out.clone(),
+        };
+
+        let filter =  KVFilter::new(drain.fuse(), Level::Info)
+            .only_pass_on_any_key_present(["err".to_string()].iter())
+            .always_suppress_any(Some(
+                HashMap::from_iter(
+                    vec![(
+                        "err".to_string(),
+                        HashSet::from_iter(vec!["None".to_string(), "".to_string()]),
+                    )]
+                )
+            ));
+
+        let logger = Logger::root(filter.fuse(), o!());
+
+        // should discard
+        info!(logger, "NO: test info");
+        info!(logger, "NO: test info"; "count" => 10);
+        info!(logger, "NO: test error"; "err" => "None");
+        info!(logger, "NO: test error"; "err" => "");
+        info!(logger, "NO: test info"; "count" => 10);
+        debug!(logger, "NO: test debug");
+
+        // should log to drain
+        info!(logger, "YES: test error"; "err" => "Panic!");
+        error!(logger, "YES: test error");
 
         println!("resulting output: {:#?}", *out.lock().unwrap());
 
