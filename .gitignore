@@ -1,5 +1,6 @@
 /target
 /.cargo
+/.idea
 Cargo.lock
 tags
 rusty-tags.vi

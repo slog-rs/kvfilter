@@ -20,9 +20,22 @@
 
 # slog-kvfilter  - Key values and Regex based filter Drain for [slog-rs]
 
-For more information, help, to report issues etc. see [slog-rs][slog-rs].
+Filter records by matching their messages, keys and values. Records can be matched
 
+ - based on logging level (debug, info, warn, ...)
+ - regular expression on record message
+ - keys and values
+ - simple filters can be arbitrarily composed using `And`, `Or` and `Not` expressions
+
+
+**slog-kvfilter has undergone a complete rewrite as of version 0.7.0.
+The API has changed. See [this issue](https://github.com/slog-rs/kvfilter/issues/15)
+for details.**
+
+slog-kvfilter documentation can be found [here](https://docs.rs/slog-kvfilter/*/slog_kvfilter/).
+
+For more information, help, to report issues etc. see
+[slog-kvfilter][slog-kvfilter] and [slog-rs][slog-rs].
+
+[slog-kvfilter]: https://github.com/slog-rs/kvfilter/
 [slog-rs]: https://github.com/slog-rs/slog
-
-Documentation can be found on 
-[`slog-kvfilter` type](https://docs.rs/slog-kvfilter/*/slog-kvfilter/index.html).
