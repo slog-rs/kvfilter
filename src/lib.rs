@@ -41,10 +41,10 @@ impl<'a> slog::Serializer for FilteringSerializer<'a> {
         let matched = !self.presence.is_empty();
 
         if matched {
-            self.presence.remove(&key);
+            self.presence.remove(AsRef::<str>::as_ref(&key));
         }
 
-        let matched = if let Some(keyvalues) = self.valuematches.get(&key) {
+        let matched = if let Some(keyvalues) = self.valuematches.get(AsRef::<str>::as_ref(&key)) {
             self.tmp_str.clear();
             fmt::write(&mut self.tmp_str, *val)?;
 
@@ -54,7 +54,7 @@ impl<'a> slog::Serializer for FilteringSerializer<'a> {
         };
 
         if matched {
-            self.valuematches.remove(&key);
+            self.valuematches.remove(AsRef::<str>::as_ref(&key));
         }
 
         Ok(())
